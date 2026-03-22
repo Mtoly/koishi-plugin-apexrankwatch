@@ -1,11 +1,11 @@
-import { Context, Schema } from 'koishi'
+import { Context } from 'koishi'
+import type { Config as PluginConfig } from './config'
+import { ConfigSchema, resolveConfig } from './config'
+import { ApexRankWatchRuntime } from './runtime'
 
 export const name = 'apexrankwatch'
+export const Config = ConfigSchema
 
-export interface Config {}
-
-export const Config: Schema<Config> = Schema.object({})
-
-export function apply(ctx: Context, config: Config) {
-  // write your plugin here
+export function apply(ctx: Context, config: PluginConfig) {
+  new ApexRankWatchRuntime(ctx, resolveConfig(config))
 }
