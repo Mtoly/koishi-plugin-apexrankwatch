@@ -1,7 +1,7 @@
 {
   "name": "koishi-plugin-apexrankwatch",
-  "description": "Apex Legends rank query and watch plugin for Koishi",
-  "version": "1.1.6",
+  "description": "用于查询 Apex 玩家段位、等级、赛季结束时间、大师猎杀人数与底分，并支持持续自动监测分数变化通知的 Koishi 插件",
+  "version": "1.1.7",
   "main": "lib/index.js",
   "typings": "lib/index.d.ts",
   "files": [
