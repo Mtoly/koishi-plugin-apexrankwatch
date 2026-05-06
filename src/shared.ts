@@ -70,6 +70,7 @@ export interface StoredPlayerRecord {
   globalRankPercent: string
   selectedLegend: string
   legendKillsPercent: string
+  remark?: string
 }
 
 export interface StoredGroupRecord {

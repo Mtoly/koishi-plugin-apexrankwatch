@@ -63,6 +63,7 @@ function normalizePlayerRecord(value: any): StoredPlayerRecord | null {
     globalRankPercent: String(value.globalRankPercent ?? value.global_rank_percent ?? '未知').trim() || '未知',
     selectedLegend: String(value.selectedLegend ?? value.selected_legend ?? '').trim(),
     legendKillsPercent,
+    remark: value.remark ? String(value.remark).trim() : undefined,
   }
 }
 

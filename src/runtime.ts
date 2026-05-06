@@ -120,6 +120,10 @@ export class ApexRankWatchRuntime {
       .alias('apex\u5217\u8868')
       .action(this.wrap(async (session) => this.handleList(session)))
 
+    this.ctx.command('apexremark <player> [remark:text]', 'set a remark for a watched player')
+      .alias('apex\u5907\u6ce8')
+      .action(this.wrap(async (session, player, remark) => this.handleRemark(session, player || '', remark || '')))
+
     this.ctx.command('apexrankremove [input:text]', 'remove a watch target')
       .alias('apex\u79fb\u9664')
       .alias('\u53d6\u6d88\u6301\u7eed\u89c6\u5978')
@@ -619,7 +623,8 @@ export class ApexRankWatchRuntime {
     let index = 0
     for (const player of Object.values(group.players)) {
       index += 1
-      lines.push(`\ud83d\udc64 \u73a9\u5bb6 ${index}: ${player.playerName}`)
+      const displayName = player.remark ? `${player.remark} (${player.playerName})` : player.playerName
+      lines.push(`\ud83d\udc64 \u73a9\u5bb6 ${index}: ${displayName}`)
       lines.push(`\ud83d\udd79\ufe0f \u5e73\u53f0: ${formatPlatform(player.platform)}`)
       lines.push(`\ud83c\udfc6 \u6bb5\u4f4d: ${formatRank(player.rankName, player.rankDiv)}`)
       lines.push(`\ud83d\udd22 \u5206\u6570: ${player.rankScore}`)
@@ -634,6 +639,45 @@ export class ApexRankWatchRuntime {
     lines.push(`\u23f1\ufe0f \u68c0\u6d4b\u95f4\u9694: ${this.config.checkInterval} \u5206\u949f`)
     lines.push(`\ud83c\udfaf \u6700\u4f4e\u6709\u6548\u5206\u6570: ${this.config.minValidScore} \u5206`)
     return lines.join('\n')
+  }
+
+  private async handleRemark(session: CommandSession, playerInput: string, remark: string) {
+    const deny = this.guardAccess(session, true)
+    if (deny) return [this.timeLine(), deny].join('\n')
+
+    const { playerName, platform } = this.parsePlayerPlatformInput(playerInput)
+    if (!playerName) {
+      return [this.timeLine(), '\u26a0\ufe0f \u8bf7\u63d0\u4f9b\u8981\u5907\u6ce8\u7684\u73a9\u5bb6\u540d\u79f0\u6216 UID\uff0c\u4f8b\u5982\uff1a/apexremark moeneri \u5927\u4f6c'].join('\n')
+    }
+
+    const groupId = this.getGroupId(session)
+    const target = this.extractTarget(session)
+    if (!groupId) {
+      return [this.timeLine(), '\u26a0\ufe0f \u6b64\u547d\u4ee4\u4ec5\u9002\u7528\u4e8e\u7fa4\u804a\uff0c\u8bf7\u5728\u7fa4\u804a\u4e2d\u4f7f\u7528\u3002'].join('\n')
+    }
+    if (target) this.groupStore.updateTarget(groupId, target)
+
+    const group = this.groupStore.getGroup(groupId)
+    if (!group || !Object.keys(group.players).length) {
+      return [this.timeLine(), '\u2139\ufe0f \u672c\u7fa4\u76ee\u524d\u6ca1\u6709\u76d1\u63a7\u4efb\u4f55\u73a9\u5bb6\u3002'].join('\n')
+    }
+
+    const { identifier, useUid } = parseIdentifier(playerName)
+    const playerKey = this.findPlayerKey(group, identifier, platform, useUid)
+    if (!playerKey) {
+      return [this.timeLine(), `\u26a0\ufe0f \u672c\u7fa4\u6ca1\u6709\u76d1\u63a7 ${playerName}，\u65e0\u6cd5\u8bbe\u7f6e\u5907\u6ce8\u3002`].join('\n')
+    }
+
+    const record = group.players[playerKey]
+    if (remark) {
+      record.remark = remark
+      await this.groupStore.save()
+      return [this.timeLine(), `\u2705 \u5df2\u5c06 ${record.playerName} \u7684\u5907\u6ce8\u8bbe\u7f6e\u4e3a ${remark}\u3002`].join('\n')
+    } else {
+      record.remark = undefined
+      await this.groupStore.save()
+      return [this.timeLine(), `\u2705 \u5df2\u6e05\u9664 ${record.playerName} \u7684\u5907\u6ce8\u3002`].join('\n')
+    }
   }
 
   private async handleRemove(session: CommandSession, input: string) {
@@ -815,10 +859,11 @@ export class ApexRankWatchRuntime {
 
       const diff = newScore - oldScore
       const diffText = diff > 0 ? `\u4e0a\u5347 ${diff}` : `\u4e0b\u964d ${Math.abs(diff)}`
+      const displayName = player.remark ? `${player.remark} (${playerData.name})` : playerData.name
       const lines = [
         '\ud83d\udcc8 Apex \u6392\u4f4d\u5206\u6570\u53d8\u5316',
         this.timeLine(),
-        `\ud83d\udc64 \u73a9\u5bb6: ${playerData.name}`,
+        `\ud83d\udc64 \u73a9\u5bb6: ${displayName}`,
         `\ud83d\udd79\ufe0f \u5e73\u53f0: ${formatPlatform(player.platform)}`,
         `\ud83d\udd22 \u539f\u5206\u6570: ${oldScore}`,
         `\ud83d\udd22 \u5f53\u524d\u5206\u6570: ${newScore}`,

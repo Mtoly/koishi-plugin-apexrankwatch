@@ -277,7 +277,7 @@ function isPlayerNotFound(data: any) {
   }
   const globalData = data.global
   if (!globalData || typeof globalData !== 'object') return true
-  return !globalData.name
+  return !globalData.name && !globalData.uid
 }
 
 function isInvalidApiKey(data: any) {
@@ -335,8 +335,8 @@ function parsePlayerStats(data: any, platform: string, fallbackName: string): Ap
   const isOnline = (toInt(realtimeData.isOnline) ?? 0) === 1 || realtimeData.isOnline === true
 
   return {
-    name: String(globalData.name ?? fallbackName),
-    uid: String(globalData.uid ?? ''),
+    name: String(globalData.name || fallbackName),
+    uid: String(globalData.uid || ''),
     level: toInt(globalData.level) ?? 0,
     rankScore: toInt(rankData.rankScore) ?? 0,
     rankName: translate(String(rankData.rankName ?? 'Unranked')),
