@@ -1,11 +1,13 @@
 import { mkdir } from 'node:fs/promises'
 import { resolve } from 'node:path'
-import { Bot, Context, Logger, Session } from 'koishi'
+import { Bot, Context, Logger, Session, h, type Fragment } from 'koishi'
 import { ApexApiClient, PlayerNotFoundError } from './api'
 import { ResolvedConfig } from './config'
+import { ApexImageRenderer } from './image'
 import { GroupStore, SettingsStore } from './storage'
 import {
   ApexPlayerStats,
+  MapRotationInfo,
   NotificationTarget,
   RuntimeSettings,
   SEASON_KEYWORD_COMMAND_BLOCKLIST,
@@ -33,6 +35,7 @@ export class ApexRankWatchRuntime {
   private readonly settingsFile: string
   private readonly groupStore: GroupStore
   private readonly settingsStore: SettingsStore
+  private readonly imageRenderer: ApexImageRenderer
   private readonly api: ApexApiClient
   private readonly configBlacklist: Set<string>
   private readonly queryBlocklist: Set<string>
@@ -54,6 +57,7 @@ export class ApexRankWatchRuntime {
     this.settingsFile = resolve(this.dataDir, 'settings.json')
     this.groupStore = new GroupStore(this.groupsFile, this.logger)
     this.settingsStore = new SettingsStore(this.settingsFile, this.logger)
+    this.imageRenderer = new ApexImageRenderer(this.dataDir)
     this.api = new ApexApiClient({
       apiKey: this.config.apiKey,
       timeoutMs: this.config.timeoutMs,
@@ -68,7 +72,18 @@ export class ApexRankWatchRuntime {
     this.whitelistGroups = splitCsv(this.config.whitelistGroups, false)
     this.registerCommands()
     this.registerSeasonKeywordMiddleware()
-    this.ready = this.initialize()
+    this.ready = this.waitForKoishiReady()
+  }
+
+  private waitForKoishiReady() {
+    let started = false
+    return new Promise<void>((resolve, reject) => {
+      this.ctx.on('ready', () => {
+        if (started) return
+        started = true
+        void this.initialize().then(resolve, reject)
+      })
+    })
   }
 
   private async initialize() {
@@ -120,7 +135,7 @@ export class ApexRankWatchRuntime {
       .alias('apex\u5217\u8868')
       .action(this.wrap(async (session) => this.handleList(session)))
 
-    this.ctx.command('apexremark <player> [remark:text]', 'set a remark for a watched player')
+    this.ctx.command('apexremark <player> [platformOrRemark:text]', 'set a remark for a watched player')
       .alias('apex\u5907\u6ce8')
       .action(this.wrap(async (session, player, remark) => this.handleRemark(session, player || '', remark || '')))
 
@@ -129,14 +144,25 @@ export class ApexRankWatchRuntime {
       .alias('\u53d6\u6d88\u6301\u7eed\u89c6\u5978')
       .action(this.wrap(async (session, input = '') => this.handleRemove(session, input)))
 
-    this.ctx.command('apexpredator', 'query predator threshold')
+    this.ctx.command('apexpredator [platform:string]', 'query predator threshold')
       .alias('apex\u730e\u6740')
-      .action(this.wrap(async (session) => this.handlePredator(session)))
+      .alias('\u730e\u6740')
+      .action(this.wrap(async (session, platform = '') => this.handlePredator(session, platform)))
 
-    this.ctx.command('apexseason', 'query current season time')
+    this.ctx.command('apexseason [season:string]', 'query current season time')
       .alias('apex\u8d5b\u5b63')
       .alias('\u65b0\u8d5b\u5b63')
-      .action(this.wrap(async (session) => this.handleSeason(session)))
+      .action(this.wrap(async (session, season = '') => this.handleSeason(session, season)))
+
+    this.ctx.command('map', 'query ranked map rotation')
+      .alias('\u5730\u56fe')
+      .alias('\u6392\u4f4d\u5730\u56fe')
+      .alias('apexmap')
+      .alias('apexrankmap')
+      .action(this.wrap(async (session) => this.handleMap(session, 'ranked')))
+
+    this.ctx.command('\u5339\u914d\u5730\u56fe', 'query battle royale map rotation')
+      .action(this.wrap(async (session) => this.handleMap(session, 'battle_royale')))
 
     this.ctx.command('apexblacklist [action:string] [input:text]', 'manage runtime blacklist')
       .alias('apex\u9ed1\u540d\u5355')
@@ -171,16 +197,21 @@ export class ApexRankWatchRuntime {
       if (this.guardAccess(session)) return
 
       try {
-        const seasonInfo = await this.api.fetchCurrentSeasonInfo()
+        const seasonInfo = await this.api.fetchSeasonInfo()
         const suffix = groupId ? '\n\ud83d\udd15 \u5173\u95ed\u8d5b\u5b63\u5173\u952e\u8bcd\u56de\u590d\uff1a/\u8d5b\u5b63\u5173\u95ed' : ''
-        return `${this.formatSeasonInfo(seasonInfo)}${suffix}`
+        try {
+          const imagePath = await this.imageRenderer.renderSeasonInfo(seasonInfo)
+          return `${h.image(imagePath)}${suffix}`
+        } catch {
+          return `${this.formatSeasonInfo(seasonInfo)}${suffix}`
+        }
       } catch (error: any) {
         this.logger.error(`season query failed: ${error?.message || error}`)
       }
     })
   }
 
-  private wrap<T extends any[]>(handler: (session: CommandSession, ...args: T) => Promise<string | void>) {
+  private wrap<T extends any[]>(handler: (session: CommandSession, ...args: T) => Promise<Fragment | void>) {
     return async ({ session }: { session?: CommandSession }, ...args: T) => {
       if (!session) return ''
       await this.ready
@@ -222,11 +253,12 @@ export class ApexRankWatchRuntime {
       || bots[0]
   }
 
-  private async sendToTarget(target: NotificationTarget | null, message: string) {
+  private async sendToTarget(target: NotificationTarget | null, message: Fragment) {
     if (!target?.channelId) {
       this.logger.warn('notification target is missing')
       return false
     }
+    if (target.platform === 'mock') return false
 
     const bot = this.getBotForTarget(target)
     if (!bot) {
@@ -240,7 +272,7 @@ export class ApexRankWatchRuntime {
     } catch (error) {
       this.logger.error(`active send failed: ${String((error as Error)?.message || error)}`)
       try {
-        if (typeof bot.internal?.sendGroupMsg === 'function') {
+        if (typeof message === 'string' && typeof bot.internal?.sendGroupMsg === 'function') {
           await bot.internal.sendGroupMsg(target.channelId, message)
           return true
         }
@@ -346,13 +378,13 @@ export class ApexRankWatchRuntime {
     let changed = false
     for (const [groupId, group] of this.groupStore.entries()) {
       const nextPlayers: Record<string, StoredPlayerRecord> = {}
-      for (const record of Object.values(group.players)) {
+      for (const [oldKey, record] of Object.entries(group.players)) {
         const platform = normalizePlatform(record.platform || 'PC')
         const lookupId = record.lookupId || record.playerName
         const useUid = Boolean(record.useUid)
         const key = buildPlayerKey(lookupId, platform, useUid)
         nextPlayers[key] = { ...record, platform, lookupId, useUid }
-        if (key !== buildPlayerKey(record.lookupId || record.playerName, record.platform || 'PC', Boolean(record.useUid))) {
+        if (oldKey !== key || record.platform !== platform || record.lookupId !== lookupId || Boolean(record.useUid) !== useUid) {
           changed = true
         }
       }
@@ -391,6 +423,16 @@ export class ApexRankWatchRuntime {
     ].join('\n')
   }
 
+  private imageRenderOptions() {
+    return {
+      checkInterval: this.config.checkInterval,
+      minValidScore: this.config.minValidScore,
+      configBlacklistCount: this.configBlacklist.size,
+      runtimeBlacklistCount: this.settings.runtimeBlacklist.length,
+      queryBlocklistCount: this.queryBlocklist.size,
+    }
+  }
+
   private async handleTest(session: CommandSession) {
     const deny = this.guardAccess(session)
     if (deny) return [this.timeLine(), deny].join('\n')
@@ -411,6 +453,13 @@ export class ApexRankWatchRuntime {
     const deny = this.guardAccess(session)
     if (deny) return [this.timeLine(), deny].join('\n')
 
+    try {
+      const imagePath = await this.imageRenderer.renderHelp(this.imageRenderOptions())
+      return h.image(imagePath)
+    } catch (error) {
+      this.logger.error(`help image render failed: ${String((error as Error)?.message || error)}`)
+    }
+
     const lines = [
       this.timeLine(),
       '\ud83d\udcd6 Apex Rank Watch \u5e2e\u52a9',
@@ -420,10 +469,13 @@ export class ApexRankWatchRuntime {
       '\u3010\u76d1\u63a7\uff08\u7fa4\u804a\uff09\u3011',
       '/apexrankwatch <\u73a9\u5bb6|uid:...> [\u5e73\u53f0]  \u522b\u540d\uff1a/apex\u76d1\u63a7 /\u6301\u7eed\u89c6\u5978',
       '/apexranklist  \u522b\u540d\uff1a/apex\u5217\u8868',
+      '/apexremark <\u73a9\u5bb6|uid:...> [\u5e73\u53f0] [\u5907\u6ce8]  \u522b\u540d\uff1a/apex\u5907\u6ce8',
       '/apexrankremove <\u73a9\u5bb6|uid:...> [\u5e73\u53f0]  \u522b\u540d\uff1a/apex\u79fb\u9664 /\u53d6\u6d88\u6301\u7eed\u89c6\u5978',
       '\u3010\u4fe1\u606f\u3011',
-      '/apexpredator  \u522b\u540d\uff1a/apex\u730e\u6740',
-      '/apexseason  \u522b\u540d\uff1a/apex\u8d5b\u5b63 /\u65b0\u8d5b\u5b63',
+      '/map  \u522b\u540d\uff1a/\u5730\u56fe /\u6392\u4f4d\u5730\u56fe /apexmap /apexrankmap',
+      '/\u5339\u914d\u5730\u56fe',
+      '/apexpredator [\u5e73\u53f0]  \u522b\u540d\uff1a/apex\u730e\u6740 /\u730e\u6740',
+      '/apexseason [\u8d5b\u5b63\u53f7|current]  \u522b\u540d\uff1a/apex\u8d5b\u5b63 /\u65b0\u8d5b\u5b63',
       '\u5173\u952e\u8bcd\uff1a\u6d88\u606f\u5305\u542b\u201c\u8d5b\u5b63\u201d\u81ea\u52a8\u56de\u590d\uff08/\u8d5b\u5b63\u5173\u95ed\uff0c/\u8d5b\u5b63\u5f00\u542f\uff09',
       '\u3010\u7ba1\u7406\u3011',
       '/apexblacklist <add|remove|list|clear> <\u73a9\u5bb6ID>  \u522b\u540d\uff1a/apex\u9ed1\u540d\u5355 /\u4e0d\u51c6\u89c6\u5978 /apexban',
@@ -470,7 +522,13 @@ export class ApexRankWatchRuntime {
         return [this.timeLine(), `\u26a0\ufe0f \u67e5\u8be2\u5230 ${playerName} \u7684\u5206\u6570\u4e3a ${player.rankScore}\uff0c\u4f4e\u4e8e\u6700\u4f4e\u6709\u6548\u5206\u6570 ${this.config.minValidScore}\uff0c\u53ef\u80fd\u662f API \u5f02\u5e38\uff0c\u8bf7\u7a0d\u540e\u518d\u8bd5\u3002`].join('\n')
       }
       player.platform = usedPlatform
-      return this.formatPlayerRankText(player)
+      try {
+        const imagePath = await this.imageRenderer.renderPlayerRank(player)
+        return h.image(imagePath)
+      } catch (error) {
+        this.logger.error(`player rank image render failed: ${String((error as Error)?.message || error)}`)
+        return this.formatPlayerRankText(player)
+      }
     } catch (error) {
       if (error instanceof PlayerNotFoundError) {
         return [this.timeLine(), '\u26a0\ufe0f \u672a\u627e\u5230\u8be5\u73a9\u5bb6\uff0c\u8bf7\u68c0\u67e5\u540d\u79f0\u662f\u5426\u6b63\u786e\uff0c\u6216\u5728\u547d\u4ee4\u672b\u5c3e\u6307\u5b9a\u5e73\u53f0\u3002'].join('\n')
@@ -480,38 +538,144 @@ export class ApexRankWatchRuntime {
     }
   }
 
-  private async handlePredator(session: CommandSession) {
+  private async handleMap(session: CommandSession, mode: 'ranked' | 'battle_royale') {
     const deny = this.guardAccess(session)
     if (deny) return [this.timeLine(), deny].join('\n')
     if (!this.config.apiKey) return this.missingApiKeyText()
+
+    try {
+      const rotationInfo = await this.api.fetchMapRotationInfo()
+      try {
+        const imagePath = await this.imageRenderer.renderMapRotation(rotationInfo, mode)
+        return h.image(imagePath)
+      } catch (error) {
+        this.logger.error(`map rotation image render failed: ${String((error as Error)?.message || error)}`)
+        return this.formatMapRotationText(rotationInfo, mode)
+      }
+    } catch (error) {
+      this.logger.error(`map rotation query failed: ${String((error as Error)?.message || error)}`)
+      return this.apiRequestFailedText(mode === 'battle_royale' ? '\u5339\u914d\u5730\u56fe\u67e5\u8be2' : '\u5730\u56fe\u8f6e\u6362\u67e5\u8be2')
+    }
+  }
+
+  private async handlePredator(session: CommandSession, platform = '') {
+    const deny = this.guardAccess(session)
+    if (deny) return [this.timeLine(), deny].join('\n')
+    if (!this.config.apiKey) return this.missingApiKeyText()
+
+    const selectedPlatform = platform ? normalizePlatform(platform) : ''
+    if (platform && !['PC', 'PS4', 'X1', 'SWITCH'].includes(selectedPlatform)) {
+      return [
+        this.timeLine(),
+        '\u26a0\ufe0f \u5e73\u53f0\u4ec5\u652f\u6301 PC / PS4 / X1 / SWITCH\u3002',
+        '\u4f8b\uff1a/apexpredator pc  \u6216  /\u730e\u6740',
+      ].join('\n')
+    }
 
     try {
       const predatorInfo = await this.api.fetchPredatorInfo()
       if (!predatorInfo.platforms.length) {
         return [this.timeLine(), '\u26a0\ufe0f \u6682\u672a\u83b7\u53d6\u5230\u730e\u6740\u95e8\u69db\u6570\u636e\u3002'].join('\n')
       }
-      const lines = [this.timeLine(), '\ud83c\udff9 Apex \u730e\u6740\u95e8\u69db\u4e0e\u5927\u5e08\u53ca\u4ee5\u4e0a\u4eba\u6570']
-      lines.push(`\ud83c\udfae \u6a21\u5f0f: ${predatorInfo.mode === 'RP' ? '\u6392\u4f4d\u79ef\u5206 (RP)' : predatorInfo.mode}`)
-      for (const entry of predatorInfo.platforms) {
-        lines.push(`\ud83c\udfaf ${formatPlatform(entry.platform)}: \u730e\u6740\u95e8\u69db ${entry.requiredRp ?? '\u672a\u77e5'}\uff0c\u5927\u5e08\u53ca\u4ee5\u4e0a\u4eba\u6570 ${entry.mastersCount ?? '\u672a\u77e5'}`)
+      try {
+        const imagePath = await this.imageRenderer.renderPredatorInfo(predatorInfo)
+        return h.image(imagePath)
+      } catch (error) {
+        this.logger.error(`predator image render failed: ${String((error as Error)?.message || error)}`)
+        return this.formatPredatorInfoText(predatorInfo, selectedPlatform)
       }
-      return lines.join('\n')
     } catch (error) {
       this.logger.error(`predator query failed: ${String((error as Error)?.message || error)}`)
       return this.apiRequestFailedText('\u67e5\u8be2')
     }
   }
 
-  private async handleSeason(session: CommandSession) {
+  private async handleSeason(session: CommandSession, season = '') {
     const deny = this.guardAccess(session)
     if (deny) return [this.timeLine(), deny].join('\n')
 
+    const seasonNumber = this.parseSeasonQuery(season)
+    if (seasonNumber === false) {
+      return [
+        this.timeLine(),
+        '\u26a0\ufe0f \u8bf7\u8f93\u5165\u6b63\u786e\u7684\u8d5b\u5b63\u53f7\uff0c\u4f8b\u5982 /apexseason 28 \u6216 /apexseason current\u3002',
+      ].join('\n')
+    }
+
     try {
-      return this.formatSeasonInfo(await this.api.fetchCurrentSeasonInfo())
+      const seasonInfo = await this.api.fetchSeasonInfo(seasonNumber)
+      try {
+        const imagePath = await this.imageRenderer.renderSeasonInfo(seasonInfo)
+        return h.image(imagePath)
+      } catch (error) {
+        this.logger.error(`season image render failed: ${String((error as Error)?.message || error)}`)
+        return this.formatSeasonInfo(seasonInfo)
+      }
     } catch (error) {
       this.logger.error(`season query failed: ${String((error as Error)?.message || error)}`)
       return [this.timeLine(), '\u274c \u67e5\u8be2\u5931\u8d25\uff1a\u65e0\u6cd5\u83b7\u53d6\u8d5b\u5b63\u65f6\u95f4\u4fe1\u606f\u3002'].join('\n')
     }
+  }
+
+  private parseSeasonQuery(raw: string): number | null | false {
+    const token = String(raw || '').trim().toLowerCase()
+    if (!token || ['current', 'curr', 'now', 'latest', '\u6700\u65b0', '\u5f53\u524d'].includes(token)) return null
+    const value = Number(token)
+    if (!Number.isInteger(value) || value < 1 || value > 99) return false
+    return value
+  }
+
+  private formatMapRotationText(rotationInfo: MapRotationInfo, mode: 'ranked' | 'battle_royale' = 'ranked') {
+    const rotationMode = mode === 'battle_royale' ? rotationInfo.battleRoyale : rotationInfo.ranked
+    const currentLabel = mode === 'battle_royale' ? '\u5f53\u524d\u4e09\u4eba\u8d5b\u5730\u56fe' : '\u5f53\u524d\u6392\u4f4d\u5730\u56fe'
+    const title = mode === 'battle_royale' ? '\ud83d\uddfa\ufe0f Apex \u4e09\u4eba\u8d5b\u5730\u56fe\u8f6e\u6362' : '\ud83d\uddfa\ufe0f Apex \u6392\u4f4d\u5730\u56fe\u8f6e\u6362'
+    if (!rotationMode.current) {
+      return [this.timeLine(), mode === 'battle_royale' ? '\u26a0\ufe0f \u6682\u672a\u83b7\u53d6\u5230\u4e09\u4eba\u8d5b\u5730\u56fe\u8f6e\u6362\u6570\u636e\uff0c\u8bf7\u7a0d\u540e\u518d\u8bd5\u3002' : '\u26a0\ufe0f \u6682\u672a\u83b7\u53d6\u5230\u6392\u4f4d\u5730\u56fe\u8f6e\u6362\u6570\u636e\uff0c\u8bf7\u7a0d\u540e\u518d\u8bd5\u3002'].join('\n')
+    }
+    const current = rotationMode.current
+    const next = rotationMode.next
+    const lines = [
+      `\ud83d\udccd ${currentLabel}\uff1a${this.formatMapName(current)}`,
+      `\ud83d\udd52 \u67e5\u8be2\u65f6\u95f4\uff1a${formatNow()}`,
+      title,
+      '\u2014\u2014',
+      `\u23f0 \u672c\u8f6e\u65f6\u95f4\uff1a${this.formatRotationRange(current)}`,
+    ]
+    if (current.remainingTimer) lines.push(`\u23f3 \u5269\u4f59\u65f6\u95f4\uff1a${current.remainingTimer}`)
+    if (next) {
+      lines.push('\u2014\u2014', `\u27a1\ufe0f \u4e0b\u4e00\u5f20\uff1a${this.formatMapName(next)}`, `\u23f0 \u4e0b\u8f6e\u65f6\u95f4\uff1a${this.formatRotationRange(next)}`)
+    }
+    lines.push('\u2139\ufe0f \u65f6\u95f4\u5747\u4e3a\u5317\u4eac\u65f6\u95f4')
+    return lines.join('\n')
+  }
+
+  private formatMapName(entry: { mapName: string; mapNameZh: string }) {
+    return entry.mapNameZh && entry.mapNameZh !== entry.mapName ? `${entry.mapNameZh} / ${entry.mapName}` : entry.mapNameZh || entry.mapName || '\u672a\u77e5'
+  }
+
+  private formatRotationRange(entry: { start: number | null; end: number | null }) {
+    return `${this.formatTimestampToBeijing(entry.start)} ~ ${this.formatTimestampToBeijing(entry.end)}`
+  }
+
+  private formatTimestampToBeijing(timestamp: number | null) {
+    if (!timestamp) return '\u672a\u77e5'
+    const date = new Date(timestamp * 1000)
+    const pad = (value: number) => String(value).padStart(2, '0')
+    return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`
+  }
+
+  private formatPredatorInfoText(predatorInfo: { mode: string; platforms: { platform: string; requiredRp: number | null; mastersCount: number | null; updateTimestamp: number | null }[] }, selectedPlatform = '') {
+    const platforms = selectedPlatform
+      ? predatorInfo.platforms.filter((entry) => entry.platform === selectedPlatform)
+      : predatorInfo.platforms
+    const lines = [this.timeLine(), '\ud83c\udff9 Apex \u730e\u6740\u7ebf\u4e0e\u5927\u5e08\u6570\u91cf']
+    lines.push(`\ud83c\udfae \u6a21\u5f0f: ${predatorInfo.mode === 'RP' ? '\u6392\u4f4d\u79ef\u5206 (RP)' : predatorInfo.mode}`)
+    for (const entry of platforms) {
+      const threshold = entry.requiredRp === null ? '\u672a\u77e5' : entry.requiredRp.toLocaleString()
+      const masters = entry.mastersCount === null ? '\u672a\u77e5' : entry.mastersCount.toLocaleString()
+      lines.push(`\ud83d\udd79\ufe0f ${formatPlatform(entry.platform)}\uff1a\u730e\u6740\u7ebf ${threshold} RP\uff5c\u5927\u5e08\u6570\u91cf ${masters}\uff08\u5305\u542b\u730e\u6740\uff09`)
+    }
+    return lines.join('\n')
   }
 
   private async handleSeasonKeywordToggle(session: CommandSession, disabled: boolean) {
@@ -588,6 +752,12 @@ export class ApexRankWatchRuntime {
       await this.groupStore.save()
 
       await this.sendToTarget(target, `\u2705 \u6d4b\u8bd5\u6d88\u606f\uff1a\u5df2\u6dfb\u52a0\u5bf9 ${player.name} \u7684\u6392\u540d\u76d1\u63a7\u3002`)
+      try {
+        const imagePath = await this.imageRenderer.renderMonitorAdded(player, normalizedPlatform, this.imageRenderOptions())
+        return h.image(imagePath)
+      } catch (error) {
+        this.logger.error(`monitor added image render failed: ${String((error as Error)?.message || error)}`)
+      }
       return [
         this.timeLine(),
         `\u2705 \u6210\u529f\u6dfb\u52a0\u5bf9 ${player.name} \u7684\u6392\u540d\u76d1\u63a7\u3002`,
@@ -619,6 +789,13 @@ export class ApexRankWatchRuntime {
       return [this.timeLine(), '\u2139\ufe0f \u672c\u7fa4\u76ee\u524d\u6ca1\u6709\u76d1\u63a7\u4efb\u4f55\u73a9\u5bb6\u3002'].join('\n')
     }
 
+    try {
+      const imagePath = await this.imageRenderer.renderWatchList(Object.values(group.players), this.imageRenderOptions())
+      return h.image(imagePath)
+    } catch (error) {
+      this.logger.error(`watch list image render failed: ${String((error as Error)?.message || error)}`)
+    }
+
     const lines = [this.timeLine(), '\ud83d\udccb \u672c\u7fa4 Apex \u6392\u540d\u76d1\u63a7\u5217\u8868']
     let index = 0
     for (const player of Object.values(group.players)) {
@@ -645,9 +822,10 @@ export class ApexRankWatchRuntime {
     const deny = this.guardAccess(session, true)
     if (deny) return [this.timeLine(), deny].join('\n')
 
-    const { playerName, platform } = this.parsePlayerPlatformInput(playerInput)
+    const parsed = this.parseRemarkParts(playerInput, remark)
+    const { playerName, platform } = parsed
     if (!playerName) {
-      return [this.timeLine(), '\u26a0\ufe0f \u8bf7\u63d0\u4f9b\u8981\u5907\u6ce8\u7684\u73a9\u5bb6\u540d\u79f0\u6216 UID\uff0c\u4f8b\u5982\uff1a/apexremark moeneri \u5927\u4f6c'].join('\n')
+      return [this.timeLine(), '\u26a0\ufe0f \u8bf7\u63d0\u4f9b\u8981\u5907\u6ce8\u7684\u73a9\u5bb6\u540d\u79f0\u6216 UID\uff0c\u4f8b\u5982\uff1a/apexremark moeneri pc \u5927\u4f6c'].join('\n')
     }
 
     const groupId = this.getGroupId(session)
@@ -664,20 +842,42 @@ export class ApexRankWatchRuntime {
 
     const { identifier, useUid } = parseIdentifier(playerName)
     const playerKey = this.findPlayerKey(group, identifier, platform, useUid)
+    if (playerKey === '__MULTI__') {
+      return [this.timeLine(), '\u26a0\ufe0f \u68c0\u6d4b\u5230\u540c\u540d\u591a\u5e73\u53f0\u76d1\u63a7\uff0c\u8bf7\u6307\u5b9a\u5e73\u53f0\uff0c\u4f8b\u5982\uff1a/apexremark moeneri pc \u5927\u4f6c'].join('\n')
+    }
     if (!playerKey) {
       return [this.timeLine(), `\u26a0\ufe0f \u672c\u7fa4\u6ca1\u6709\u76d1\u63a7 ${playerName}，\u65e0\u6cd5\u8bbe\u7f6e\u5907\u6ce8\u3002`].join('\n')
     }
 
     const record = group.players[playerKey]
-    if (remark) {
-      record.remark = remark
+    const cleanRemark = this.sanitizeRemark(parsed.remark)
+    if (cleanRemark) {
+      record.remark = cleanRemark
       await this.groupStore.save()
-      return [this.timeLine(), `\u2705 \u5df2\u5c06 ${record.playerName} \u7684\u5907\u6ce8\u8bbe\u7f6e\u4e3a ${remark}\u3002`].join('\n')
+      return [this.timeLine(), `\u2705 \u5df2\u5c06 ${record.playerName} \u7684\u5907\u6ce8\u8bbe\u7f6e\u4e3a ${cleanRemark}\u3002`].join('\n')
     } else {
       record.remark = undefined
       await this.groupStore.save()
       return [this.timeLine(), `\u2705 \u5df2\u6e05\u9664 ${record.playerName} \u7684\u5907\u6ce8\u3002`].join('\n')
     }
+  }
+
+  private sanitizeRemark(remark: string) {
+    return String(remark || '').replace(/[\r\n\t\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 32)
+  }
+
+  private parseRemarkParts(playerInput: string, remarkInput: string) {
+    const parsed = this.parsePlayerPlatformInput(playerInput)
+    let remark = String(remarkInput || '').trim()
+    if (!parsed.platform && remark) {
+      const parts = remark.split(/\s+/)
+      const platform = normalizePlatform(parts[0])
+      if (['PC', 'PS4', 'X1', 'SWITCH'].includes(platform)) {
+        parsed.platform = platform
+        remark = parts.slice(1).join(' ')
+      }
+    }
+    return { ...parsed, remark }
   }
 
   private async handleRemove(session: CommandSession, input: string) {
@@ -877,7 +1077,13 @@ export class ApexRankWatchRuntime {
       if (playerData.selectedLegend) lines.push(`\ud83e\uddb8 \u5f53\u524d\u82f1\u96c4: ${playerData.selectedLegend}`)
       if (playerData.legendKillsRank) lines.push(`\ud83c\udfaf \u51fb\u6740\u6392\u540d: \u5168\u7403 ${playerData.legendKillsRank.globalPercent}%`)
       if (playerData.currentState) lines.push(`\ud83c\udfae \u5f53\u524d\u72b6\u6001: ${playerData.currentState}`)
-      await this.sendToTarget(group.target, lines.join('\n'))
+      try {
+        const imagePath = await this.imageRenderer.renderRankChange(playerData, oldScore, newScore, player.platform, seasonReset)
+        await this.sendToTarget(group.target, h.image(imagePath))
+      } catch (error) {
+        this.logger.error(`rank change image render failed: ${String((error as Error)?.message || error)}`)
+        await this.sendToTarget(group.target, lines.join('\n'))
+      }
     } catch (error) {
       if (error instanceof PlayerNotFoundError) {
         this.logger.warn(`player not found during poll: ${groupId}/${player.playerName}`)

@@ -25,6 +25,24 @@ export interface ApexPlayerStats {
   platform: string
 }
 
+export interface MapRotationEntry {
+  start: number | null
+  end: number | null
+  mapName: string
+  mapNameZh: string
+  remainingTimer: string
+}
+
+export interface MapRotationMode {
+  current: MapRotationEntry | null
+  next: MapRotationEntry | null
+}
+
+export interface MapRotationInfo {
+  ranked: MapRotationMode
+  battleRoyale: MapRotationMode
+}
+
 export interface PredatorPlatformInfo {
   platform: string
   requiredRp: number | null
@@ -48,6 +66,7 @@ export interface SeasonInfo {
   seasonUrl: string
   startIso: string
   endIso: string
+  statusText?: string
 }
 
 export interface NotificationTarget {
@@ -115,7 +134,7 @@ export const NAME_MAP: Record<string, string> = {
   Pathfinder: '探路者',
   Wraith: '恶灵',
   Bangalore: '班加罗尔',
-  Caustic: '腐蚀',
+  Caustic: '侵蚀',
   Mirage: '幻象',
   Octane: '动力小子',
   Wattson: '沃特森',
@@ -134,8 +153,16 @@ export const NAME_MAP: Record<string, string> = {
   Catalyst: '卡特莉丝',
   Ballistic: '弹道',
   Conduit: '导管',
-  Alter: '幻影',
-  Sparrow: '麻雀',
+  Alter: '变幻',
+  Sparrow: '琉雀',
+  Axle: '艾克赛尔',
+  'Broken Moon': '残月',
+  'Kings Canyon': '诸王峡谷',
+  Olympus: '奥林匹斯',
+  "World's Edge": '世界尽头',
+  'Worlds Edge': '世界尽头',
+  'Storm Point': '风暴点',
+  'E-District': '电力区',
   'BR Kills': '击杀数',
   'BR Wins': '胜场数',
   'BR Damage': '造成伤害',
@@ -174,8 +201,18 @@ export const SEASON_KEYWORD_COMMAND_BLOCKLIST = new Set([
   '赛季开启',
 ])
 
+function normalizeTranslationKey(value: unknown) {
+  return String(value || '').trim().toLowerCase().replace(/[^a-z0-9]+/g, '')
+}
+
+const NORMALIZED_NAME_MAP: Record<string, string> = Object.fromEntries(
+  Object.entries(NAME_MAP).map(([key, value]) => [normalizeTranslationKey(key), value]),
+)
+
 export function translate(name: string) {
-  return NAME_MAP[name] || name
+  const text = String(name || '').trim()
+  if (!text) return text
+  return NAME_MAP[text] || NORMALIZED_NAME_MAP[normalizeTranslationKey(text)] || text
 }
 
 export function translateState(stateText: unknown) {
@@ -322,7 +359,8 @@ export function formatPlatform(platform: string) {
 }
 
 export function formatRank(rankName: string, rankDiv: number) {
-  return rankDiv ? `${rankName} ${rankDiv}` : rankName
+  const translated = translate(rankName)
+  return rankDiv ? `${translated} ${rankDiv}` : translated
 }
 
 export function maskSecret(value: unknown) {

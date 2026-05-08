@@ -1,6 +1,11 @@
 lib
 dist
 external
+data
+test
+*.tgz
+.env
+.env.*
 
 node_modules
 npm-debug.log
