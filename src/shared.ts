@@ -103,6 +103,40 @@ export interface RuntimeSettings {
   seasonKeywordDisabledGroups: string[]
 }
 
+export interface UserBindingRecord {
+  userId: string
+  lookupId: string
+  useUid: boolean
+  platform: string
+  playerName: string
+  uid: string
+  updatedAt: number
+}
+
+export interface ScoreHistoryEntry {
+  groupId: string
+  playerKey: string
+  playerName: string
+  remarkSnapshot?: string
+  displayNameSnapshot: string
+  platform: string
+  oldScore: number
+  newScore: number
+  delta: number
+  recordedAt: number
+}
+
+export interface LeaderboardEntry {
+  playerKey: string
+  playerName: string
+  remarkSnapshot?: string
+  displayName: string
+  platform: string
+  netDelta: number
+  latestScore: number
+  latestRecordedAt: number
+}
+
 export const PLATFORM_SEARCH_ORDER = ['PC', 'PS4', 'X1', 'SWITCH'] as const
 
 export const NAME_MAP: Record<string, string> = {
@@ -302,6 +336,87 @@ export function normalizeLookupValue(value: string) {
 export function buildPlayerKey(lookupId: string, platform: string, useUid: boolean) {
   const prefix = useUid ? 'uid:' : 'name:'
   return `${prefix}${lookupId.trim().toLowerCase()}@${normalizePlatform(platform)}`
+}
+
+export function formatLookupIdentifier(lookupId: string, useUid: boolean) {
+  const normalized = String(lookupId || '').trim()
+  if (!normalized) return ''
+  return useUid ? `uid:${normalized}` : normalized
+}
+
+export function sanitizeRemark(value: unknown, maxLength = 32) {
+  return String(value || '')
+    .replace(/[\r\n\t\u0000-\u001f\u007f]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, maxLength)
+}
+
+export function formatPlayerDisplayName(playerName: string, remark?: string, includeOriginal = true) {
+  const normalizedPlayerName = String(playerName || '').trim() || '未知玩家'
+  const normalizedRemark = sanitizeRemark(remark)
+  if (!normalizedRemark) return normalizedPlayerName
+  if (!includeOriginal || normalizedRemark === normalizedPlayerName) return normalizedRemark
+  return `${normalizedRemark} (${normalizedPlayerName})`
+}
+
+const BEIJING_OFFSET_MS = 8 * 60 * 60 * 1000
+const DAY_MS = 24 * 60 * 60 * 1000
+
+export function getBeijingDayStartTimestamp(now = Date.now()) {
+  const shifted = now + BEIJING_OFFSET_MS
+  return Math.floor(shifted / DAY_MS) * DAY_MS - BEIJING_OFFSET_MS
+}
+
+export function getBeijingWeekStartTimestamp(now = Date.now()) {
+  const dayStart = getBeijingDayStartTimestamp(now)
+  const shifted = dayStart + BEIJING_OFFSET_MS
+  const weekday = new Date(shifted).getUTCDay()
+  const daysSinceMonday = (weekday + 6) % 7
+  return dayStart - daysSinceMonday * DAY_MS
+}
+
+export function getBeijingLeaderboardRange(period: 'day' | 'week', now = Date.now()) {
+  const start = period === 'day' ? getBeijingDayStartTimestamp(now) : getBeijingWeekStartTimestamp(now)
+  return {
+    start,
+    endExclusive: now + 1,
+  }
+}
+
+export function isTimestampInRange(timestamp: number, start: number, endExclusive: number) {
+  return timestamp >= start && timestamp < endExclusive
+}
+
+export function summarizeLeaderboard(entries: ScoreHistoryEntry[]) {
+  const aggregated = new Map<string, LeaderboardEntry>()
+  for (const entry of entries) {
+    const existing = aggregated.get(entry.playerKey)
+    if (!existing) {
+      aggregated.set(entry.playerKey, {
+        playerKey: entry.playerKey,
+        playerName: entry.playerName,
+        remarkSnapshot: entry.remarkSnapshot,
+        displayName: entry.displayNameSnapshot || formatPlayerDisplayName(entry.playerName, entry.remarkSnapshot),
+        platform: entry.platform,
+        netDelta: entry.delta,
+        latestScore: entry.newScore,
+        latestRecordedAt: entry.recordedAt,
+      })
+      continue
+    }
+
+    existing.netDelta += entry.delta
+    if (entry.recordedAt >= existing.latestRecordedAt) {
+      existing.playerName = entry.playerName
+      existing.remarkSnapshot = entry.remarkSnapshot
+      existing.displayName = entry.displayNameSnapshot || formatPlayerDisplayName(entry.playerName, entry.remarkSnapshot)
+      existing.platform = entry.platform
+      existing.latestScore = entry.newScore
+      existing.latestRecordedAt = entry.recordedAt
+    }
+  }
+  return Array.from(aggregated.values())
 }
 
 export function toInt(value: unknown): number | null {

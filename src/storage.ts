@@ -6,8 +6,11 @@ import {
   StoredGroupRecord,
   StoredPlayerRecord,
   LoggerLike,
+  ScoreHistoryEntry,
+  UserBindingRecord,
   coerceBool,
   normalizePlatform,
+  sanitizeRemark,
   toInt,
 } from './shared'
 
@@ -63,7 +66,7 @@ function normalizePlayerRecord(value: any): StoredPlayerRecord | null {
     globalRankPercent: String(value.globalRankPercent ?? value.global_rank_percent ?? '未知').trim() || '未知',
     selectedLegend: String(value.selectedLegend ?? value.selected_legend ?? '').trim(),
     legendKillsPercent,
-    remark: value.remark ? String(value.remark).trim() : undefined,
+    remark: sanitizeRemark(value.remark),
   }
 }
 
@@ -87,6 +90,48 @@ function normalizeGroupRecord(groupId: string, value: any): StoredGroupRecord | 
     groupId: normalizedGroupId,
     target,
     players,
+  }
+}
+
+function normalizeBindingRecord(userId: string, value: any): UserBindingRecord | null {
+  if (!value || typeof value !== 'object') return null
+  const normalizedUserId = String(value.userId ?? value.user_id ?? userId).trim() || userId
+  const lookupId = String(value.lookupId ?? value.lookup_id ?? '').trim()
+  if (!normalizedUserId || !lookupId) return null
+  return {
+    userId: normalizedUserId,
+    lookupId,
+    useUid: coerceBool(value.useUid ?? value.use_uid, false),
+    platform: normalizePlatform(String(value.platform ?? 'PC')),
+    playerName: String(value.playerName ?? value.player_name ?? lookupId).trim() || lookupId,
+    uid: String(value.uid ?? '').trim(),
+    updatedAt: toInt(value.updatedAt ?? value.updated_at) ?? 0,
+  }
+}
+
+function normalizeScoreHistoryEntry(value: any): ScoreHistoryEntry | null {
+  if (!value || typeof value !== 'object') return null
+  const groupId = String(value.groupId ?? value.group_id ?? '').trim()
+  const playerKey = String(value.playerKey ?? value.player_key ?? '').trim()
+  const playerName = String(value.playerName ?? value.player_name ?? '').trim()
+  if (!groupId || !playerKey || !playerName) return null
+  const platform = normalizePlatform(String(value.platform ?? 'PC'))
+  const oldScore = toInt(value.oldScore ?? value.old_score)
+  const newScore = toInt(value.newScore ?? value.new_score)
+  const delta = toInt(value.delta)
+  const recordedAt = toInt(value.recordedAt ?? value.recorded_at) ?? 0
+  if (oldScore === null || newScore === null || delta === null || !recordedAt) return null
+  return {
+    groupId,
+    playerKey,
+    playerName,
+    remarkSnapshot: sanitizeRemark(value.remarkSnapshot ?? value.remark_snapshot) || undefined,
+    displayNameSnapshot: String(value.displayNameSnapshot ?? value.display_name_snapshot ?? playerName).trim() || playerName,
+    platform,
+    oldScore,
+    newScore,
+    delta,
+    recordedAt,
   }
 }
 
@@ -204,5 +249,85 @@ export class SettingsStore {
       runtime_blacklist: Array.from(new Set(settings.runtimeBlacklist)).sort(),
       season_keyword_disabled_groups: Array.from(new Set(settings.seasonKeywordDisabledGroups)).sort(),
     })
+  }
+}
+
+export class BindingStore {
+  private bindings: Record<string, UserBindingRecord> = {}
+
+  constructor(private readonly filePath: string, private readonly logger: LoggerLike) {}
+
+  async load() {
+    try {
+      const raw = JSON.parse(await readFile(this.filePath, 'utf8'))
+      if (!raw || typeof raw !== 'object') return
+      this.bindings = {}
+      for (const [userId, value] of Object.entries(raw)) {
+        const normalized = normalizeBindingRecord(userId, value)
+        if (!normalized) continue
+        this.bindings[normalized.userId] = normalized
+      }
+    } catch (error: any) {
+      if (error?.code !== 'ENOENT') {
+        this.logger.error(`加载 bindings.json 失败: ${error?.message || error}`)
+      }
+    }
+  }
+
+  async save() {
+    await writeJsonAtomic(this.filePath, this.bindings)
+  }
+
+  get(userId: string) {
+    return this.bindings[userId]
+  }
+
+  set(record: UserBindingRecord) {
+    this.bindings[record.userId] = { ...record }
+  }
+
+  remove(userId: string) {
+    if (!this.bindings[userId]) return false
+    delete this.bindings[userId]
+    return true
+  }
+}
+
+export class ScoreHistoryStore {
+  private entries: ScoreHistoryEntry[] = []
+
+  constructor(private readonly filePath: string, private readonly logger: LoggerLike, private readonly retentionDays = 90) {}
+
+  async load() {
+    try {
+      const raw = JSON.parse(await readFile(this.filePath, 'utf8'))
+      if (!Array.isArray(raw)) return
+      this.entries = raw.map((value) => normalizeScoreHistoryEntry(value)).filter(Boolean) as ScoreHistoryEntry[]
+      this.prune()
+    } catch (error: any) {
+      if (error?.code !== 'ENOENT') {
+        this.logger.error(`加载 score-history.json 失败: ${error?.message || error}`)
+      }
+      this.entries = []
+    }
+  }
+
+  async save() {
+    this.prune()
+    await writeJsonAtomic(this.filePath, this.entries)
+  }
+
+  async append(entry: ScoreHistoryEntry) {
+    this.entries.push({ ...entry })
+    await this.save()
+  }
+
+  listByGroup(groupId: string) {
+    return this.entries.filter((entry) => entry.groupId === groupId)
+  }
+
+  private prune(now = Date.now()) {
+    const threshold = now - this.retentionDays * 24 * 60 * 60 * 1000
+    this.entries = this.entries.filter((entry) => entry.recordedAt >= threshold)
   }
 }

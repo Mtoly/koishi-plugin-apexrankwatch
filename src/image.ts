@@ -4,6 +4,7 @@ import { dirname, resolve } from 'node:path'
 import { createCanvas, loadImage } from '@napi-rs/canvas'
 import {
   ApexPlayerStats,
+  LeaderboardEntry,
   MapRotationEntry,
   MapRotationInfo,
   PredatorInfo,
@@ -11,6 +12,7 @@ import {
   SeasonInfo,
   StoredPlayerRecord,
   formatPlatform,
+  formatPlayerDisplayName,
   formatRank,
   translate,
 } from './shared'
@@ -36,6 +38,16 @@ type ImageRenderOptions = {
   queryBlocklistCount?: number
 }
 
+type RankRenderPlayer = ApexPlayerStats & {
+  displayName?: string
+}
+
+type LeaderboardRenderOptions = {
+  periodLabel: string
+  directionLabel: string
+  periodRangeText: string
+}
+
 function packageRoot() {
   return resolve(__dirname, '..')
 }
@@ -53,7 +65,7 @@ function safeName(value: string) {
 }
 
 function font(size: number, bold = false) {
-  return `${bold ? 700 : 400} ${size}px "Microsoft YaHei", "SimHei", "Segoe UI", sans-serif`
+  return `${bold ? 700 : 400} ${size}px "Noto Sans CJK SC", "Source Han Sans SC", "Microsoft YaHei", "PingFang SC", "Hiragino Sans GB", "WenQuanYi Zen Hei", "SimHei", "Arial Unicode MS", "Segoe UI", sans-serif`
 }
 
 function setFont(ctx: any, size: number, bold = false) {
@@ -398,6 +410,10 @@ function rankDisplay(player: ApexPlayerStats) {
   return formatRank(player.rankName, player.rankDiv) || '未知'
 }
 
+function playerDisplayName(player: RankRenderPlayer) {
+  return formatPlayerDisplayName(player.displayName || player.name, undefined, false) || '未知玩家'
+}
+
 function displayMapName(entry: MapRotationEntry) {
   const translatedZh = translate(entry.mapNameZh)
   if (translatedZh && translatedZh !== entry.mapNameZh) return translatedZh
@@ -524,9 +540,9 @@ export class ApexImageRenderer {
     })
   }
 
-  async renderMonitorAdded(player: ApexPlayerStats, platform: string, options: ImageRenderOptions = {}) {
+  async renderMonitorAdded(player: RankRenderPlayer, platform: string, options: ImageRenderOptions = {}) {
     const key = `monitor-added:${JSON.stringify({ player, platform, options })}`
-    return this.cached(key, 'monitor_added_cards', `monitor_added_${safeName(player.name)}.png`, async (filePath) => {
+    return this.cached(key, 'monitor_added_cards', `monitor_added_${safeName(playerDisplayName(player))}.png`, async (filePath) => {
       const canvas = createCanvas(CARD_WIDTH, MONITOR_ADDED_HEIGHT)
       const ctx = canvas.getContext('2d')
       this.drawRankBackground(ctx, CARD_WIDTH, MONITOR_ADDED_HEIGHT)
@@ -580,9 +596,9 @@ export class ApexImageRenderer {
     })
   }
 
-  async renderPlayerRank(player: ApexPlayerStats) {
+  async renderPlayerRank(player: RankRenderPlayer) {
     const key = `player:${JSON.stringify(player)}`
-    return this.cached(key, 'player_rank_cards', `player_rank_${safeName(player.name)}.png`, async (filePath) => {
+    return this.cached(key, 'player_rank_cards', `player_rank_${safeName(playerDisplayName(player))}.png`, async (filePath) => {
       const canvas = createCanvas(CARD_WIDTH, CARD_HEIGHT)
       const ctx = canvas.getContext('2d')
       this.drawRankBackground(ctx, CARD_WIDTH, CARD_HEIGHT)
@@ -599,9 +615,9 @@ export class ApexImageRenderer {
     })
   }
 
-  async renderRankChange(player: ApexPlayerStats, oldScore: number, newScore: number, platform: string, isSeasonReset: boolean) {
+  async renderRankChange(player: RankRenderPlayer, oldScore: number, newScore: number, platform: string, isSeasonReset: boolean) {
     const key = `rank-change:${JSON.stringify({ player, oldScore, newScore, platform, isSeasonReset })}`
-    return this.cached(key, 'rank_change_cards', `rank_change_${safeName(player.name)}_${Date.now()}.png`, async (filePath) => {
+    return this.cached(key, 'rank_change_cards', `rank_change_${safeName(playerDisplayName(player))}_${Date.now()}.png`, async (filePath) => {
       const canvas = createCanvas(CARD_WIDTH, CARD_HEIGHT)
       const ctx = canvas.getContext('2d')
       this.drawRankBackground(ctx, CARD_WIDTH, CARD_HEIGHT)
@@ -691,6 +707,38 @@ export class ApexImageRenderer {
     })
   }
 
+  async renderLeaderboard(entries: LeaderboardEntry[], options: LeaderboardRenderOptions) {
+    const title = `Apex ${options.periodLabel}${options.directionLabel}榜`
+    const key = `leaderboard:${JSON.stringify({ entries, options })}`
+    return this.cached(key, 'leaderboard_cards', `leaderboard_${safeName(title)}.png`, async (filePath) => {
+      const rowCount = Math.max(1, Math.min(10, entries.length || 1))
+      const rowHeight = 118
+      const rowGap = 14
+      const footerHeight = 92
+      const listTop = 366
+      const height = Math.max(760, listTop + rowCount * (rowHeight + rowGap) + footerHeight)
+      const canvas = createCanvas(CARD_WIDTH, height)
+      const ctx = canvas.getContext('2d')
+      this.drawRankBackground(ctx, CARD_WIDTH, height)
+      this.drawOuterFrame(ctx, CARD_WIDTH, height)
+      await this.drawLeaderboardHeader(ctx, title, options.periodRangeText)
+      this.drawLeaderboardSummary(ctx, entries, options)
+
+      let y = listTop
+      const shownEntries = entries.slice(0, 10)
+      for (let index = 0; index < shownEntries.length; index += 1) {
+        this.drawLeaderboardRow(ctx, [54, y, CARD_WIDTH - 54, y + rowHeight], index + 1, shownEntries[index], options)
+        y += rowHeight + rowGap
+      }
+
+      const footerText = entries.length > shownEntries.length
+        ? `已展示前 ${shownEntries.length} 位，还有 ${entries.length - shownEntries.length} 位玩家未展示`
+        : '统计范围与时间均按北京时间计算'
+      drawCenteredStrokedText(ctx, footerText, fitFont(ctx, footerText, 28, 20, CARD_WIDTH - 150, true), true, 54, CARD_WIDTH - 54, height - 84, height - 40, [202, 210, 220, 255])
+      await this.writePng(canvas, filePath)
+    })
+  }
+
   private helpCardSections(options: ImageRenderOptions): Array<[Box, string, Array<[string, string]>]> {
     return [
       [
@@ -699,6 +747,8 @@ export class ApexImageRenderer {
         [
           ['/apexrank 玩家 [平台]', '查询玩家段位、分数、在线状态'],
           ['/apex查询 /视奸', '中文别名，默认 PC，支持 uid:'],
+          ['/apex查分 [玩家|uid:...]', '无参数查询绑定账号，也可临时指定目标'],
+          ['/apex绑定 /apex解绑 /apex我的账号', '绑定默认 Apex 账号并查看绑定信息'],
         ],
       ],
       [
@@ -709,6 +759,8 @@ export class ApexImageRenderer {
           ['/apexranklist /apex列表', '查看本群监控列表'],
           ['/apexremark 玩家 [平台] [备注] /apex备注', '设置或清除监控备注'],
           ['/apexrankremove 玩家 [平台] /取消持续视奸', '移除指定玩家监控'],
+          ['/apex日上分榜 /apex日掉分榜', '查看当前群北京时间自然日榜单'],
+          ['/apex周上分榜 /apex周掉分榜', '查看当前群北京时间自然周榜单'],
           ['/apex监控 /持续视奸', '添加监控中文别名'],
         ],
       ],
@@ -1037,7 +1089,39 @@ export class ApexImageRenderer {
     drawTextStroked(ctx, 288, centeredTextY(ctx, value, box[1], box[3]), value, [244, 244, 239, 255])
   }
 
-  private async drawPlayerProfilePanel(ctx: any, box: Box, player: ApexPlayerStats) {
+  private async drawLeaderboardHeader(ctx: any, title: string, periodRangeText: string) {
+    const box: Box = [54, 54, 1068, 224]
+    drawPanelBase(ctx, box, [12, 14, 19, 238], 150)
+    this.drawChartIcon(ctx, [94, 82, 220, 190])
+    drawCenteredStrokedText(ctx, title, fitFont(ctx, title, 62, 40, 690, true), true, 250, 940, 72, 148, [248, 248, 244, 255], 2)
+    drawCenteredStrokedText(ctx, periodRangeText, fitFont(ctx, periodRangeText, 26, 18, 760, true), true, 240, 980, 150, 202, [205, 212, 222, 255])
+    ctx.fillStyle = rgba([236, 48, 52, 220])
+    ctx.fillRect(760, 214, 178, 6)
+  }
+
+  private drawLeaderboardSummary(ctx: any, entries: LeaderboardEntry[], options: LeaderboardRenderOptions) {
+    this.drawMiniInfoPill(ctx, [54, 244, 370, 338], '上榜玩家', `${entries.length} 位`)
+    this.drawMiniInfoPill(ctx, [388, 244, 734, 338], '统计周期', `${options.periodLabel}榜`)
+    this.drawMiniInfoPill(ctx, [752, 244, 1068, 338], '榜单类型', `${options.directionLabel}榜`)
+  }
+
+  private drawLeaderboardRow(ctx: any, box: Box, index: number, entry: LeaderboardEntry, options: LeaderboardRenderOptions) {
+    drawPanelBase(ctx, box, [13, 16, 21, 240], 92)
+    const deltaText = options.directionLabel === '上分' ? `+${entry.netDelta}` : `-${Math.abs(entry.netDelta)}`
+    const deltaColor: Color = options.directionLabel === '上分' ? [88, 210, 126, 255] : [238, 62, 66, 255]
+    const nameText = `${index}. ${entry.displayName}`
+    const metaText = `${formatPlatform(entry.platform)} · 当前分 ${entry.latestScore}`
+    setFont(ctx, fitFont(ctx, nameText, 34, 22, 660, true), true)
+    drawTextStroked(ctx, box[0] + 42, box[1] + 24 + textMetrics(ctx, nameText).ascent, nameText, [250, 250, 246, 255])
+    setFont(ctx, fitFont(ctx, metaText, 24, 18, 520, false))
+    drawTextStroked(ctx, box[0] + 44, box[1] + 72 + textMetrics(ctx, metaText).ascent, metaText, [190, 198, 210, 255])
+    drawCenteredStrokedText(ctx, '净变化', 22, true, box[2] - 246, box[2] - 28, box[1] + 18, box[1] + 48, [176, 184, 196, 255])
+    drawCenteredStrokedText(ctx, deltaText, fitFont(ctx, deltaText, 46, 28, 190, true), true, box[2] - 246, box[2] - 28, box[1] + 48, box[1] + 104, deltaColor, 2)
+    ctx.fillStyle = rgba([221, 48, 52, 185])
+    ctx.fillRect(box[2] - 218, box[3] - 18, 160, 6)
+  }
+
+  private async drawPlayerProfilePanel(ctx: any, box: Box, player: RankRenderPlayer) {
     drawPanelBase(ctx, box, [13, 16, 21, 240], 105)
     const avatar: Box = [box[0] + 38, box[1] + 48, box[0] + 192, box[1] + 202]
     drawIconOctagon(ctx, avatar)
@@ -1045,8 +1129,8 @@ export class ApexImageRenderer {
     const textLeft = box[0] + 220
     const textRight = box[2] - 24
     drawCenteredStrokedText(ctx, '玩家信息', 30, true, textLeft, textRight, box[1] + 48, box[1] + 92, [190, 192, 196, 255])
-    const name = player.name || '未知'
-    drawCenteredStrokedText(ctx, name, fitFont(ctx, name, 54, 34, box[2] - box[0] - 245, true), true, textLeft, textRight, box[1] + 112, box[1] + 174, [250, 250, 246, 255], 2)
+    const name = playerDisplayName(player)
+    drawCenteredStrokedText(ctx, name, fitFont(ctx, name, 54, 30, box[2] - box[0] - 245, true), true, textLeft, textRight, box[1] + 112, box[1] + 174, [250, 250, 246, 255], 2)
     const uid = player.uid ? `UID ${player.uid}` : 'UID 未知'
     drawCenteredStrokedText(ctx, uid, fitFont(ctx, uid, 27, 20, box[2] - box[0] - 245), false, textLeft, textRight, box[1] + 192, box[1] + 236, [170, 176, 186, 255])
     ctx.fillStyle = rgba([221, 48, 52, 185])
@@ -1091,7 +1175,7 @@ export class ApexImageRenderer {
     }
     const valueBottom = secondary ? box[3] - 58 : box[3] - 26
     drawCenteredStrokedText(ctx, label, 34, true, box[0], box[2], box[1] + 178, box[1] + 224, [190, 192, 196, 255])
-    drawCenteredStrokedText(ctx, value, fitFont(ctx, value, 46, 30, box[2] - box[0] - 56, true), true, box[0] + 18, box[2] - 18, box[1] + 232, valueBottom, [250, 250, 246, 255])
+    drawCenteredStrokedText(ctx, value, fitFont(ctx, value, 42, 24, box[2] - box[0] - 56, true), true, box[0] + 18, box[2] - 18, box[1] + 232, valueBottom, [250, 250, 246, 255])
     if (secondary) {
       drawCenteredStrokedText(ctx, secondary, fitFont(ctx, secondary, 27, 20, box[2] - box[0] - 56, true), true, box[0] + 22, box[2] - 22, box[3] - 58, box[3] - 22, [207, 211, 218, 255])
     }
@@ -1181,7 +1265,7 @@ export class ApexImageRenderer {
     drawCenteredStrokedText(ctx, '当前状态', 32, true, box[0], box[2], box[1] + 178, box[1] + 226, [190, 192, 196, 255])
     const button: Box = [box[0] + 58, box[1] + 238, box[2] - 58, box[1] + 320]
     fillRoundedRect(ctx, button, 8, [186, 42, 42, 245], [255, 98, 84, 230], 2)
-    drawCenteredStrokedText(ctx, status || '未知', fitFont(ctx, status || '未知', 42, 28, 206, true), true, button[0], button[2], button[1], button[3], [255, 247, 235, 255])
+    drawCenteredStrokedText(ctx, status || '未知', fitFont(ctx, status || '未知', 38, 24, 206, true), true, button[0], button[2], button[1], button[3], [255, 247, 235, 255])
   }
 
   private drawRankIcon(ctx: any, icon: string, box: Box) {

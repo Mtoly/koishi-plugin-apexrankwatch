@@ -4,26 +4,35 @@ import { Bot, Context, Logger, Session, h, type Fragment } from 'koishi'
 import { ApexApiClient, PlayerNotFoundError } from './api'
 import { ResolvedConfig } from './config'
 import { ApexImageRenderer } from './image'
-import { GroupStore, SettingsStore } from './storage'
+import { BindingStore, GroupStore, ScoreHistoryStore, SettingsStore } from './storage'
 import {
   ApexPlayerStats,
+  LeaderboardEntry,
   MapRotationInfo,
   NotificationTarget,
   RuntimeSettings,
+  ScoreHistoryEntry,
   SEASON_KEYWORD_COMMAND_BLOCKLIST,
   StoredGroupRecord,
   StoredPlayerRecord,
+  UserBindingRecord,
   buildPlayerKey,
   formatItems,
+  formatLookupIdentifier,
   formatNow,
   formatPlatform,
+  formatPlayerDisplayName,
   formatRank,
+  getBeijingLeaderboardRange,
   isLikelySeasonReset,
   isScoreDropAbnormal,
+  isTimestampInRange,
   normalizeLookupValue,
   normalizePlatform,
   parseIdentifier,
+  sanitizeRemark,
   splitCsv,
+  summarizeLeaderboard,
 } from './shared'
 
 type CommandSession = Session
@@ -33,8 +42,12 @@ export class ApexRankWatchRuntime {
   private readonly dataDir: string
   private readonly groupsFile: string
   private readonly settingsFile: string
+  private readonly bindingsFile: string
+  private readonly scoreHistoryFile: string
   private readonly groupStore: GroupStore
   private readonly settingsStore: SettingsStore
+  private readonly bindingStore: BindingStore
+  private readonly scoreHistoryStore: ScoreHistoryStore
   private readonly imageRenderer: ApexImageRenderer
   private readonly api: ApexApiClient
   private readonly configBlacklist: Set<string>
@@ -55,8 +68,12 @@ export class ApexRankWatchRuntime {
     this.dataDir = resolve(process.cwd(), this.config.dataDir)
     this.groupsFile = resolve(this.dataDir, 'groups.json')
     this.settingsFile = resolve(this.dataDir, 'settings.json')
+    this.bindingsFile = resolve(this.dataDir, 'bindings.json')
+    this.scoreHistoryFile = resolve(this.dataDir, 'score-history.json')
     this.groupStore = new GroupStore(this.groupsFile, this.logger)
     this.settingsStore = new SettingsStore(this.settingsFile, this.logger)
+    this.bindingStore = new BindingStore(this.bindingsFile, this.logger)
+    this.scoreHistoryStore = new ScoreHistoryStore(this.scoreHistoryFile, this.logger)
     this.imageRenderer = new ApexImageRenderer(this.dataDir)
     this.api = new ApexApiClient({
       apiKey: this.config.apiKey,
@@ -90,6 +107,8 @@ export class ApexRankWatchRuntime {
     await mkdir(this.dataDir, { recursive: true })
     await this.groupStore.load()
     this.settings = await this.settingsStore.load()
+    await this.bindingStore.load()
+    await this.scoreHistoryStore.load()
     await this.migrateStoreKeys()
 
     this.ctx.setInterval(() => {
@@ -126,6 +145,19 @@ export class ApexRankWatchRuntime {
       .alias('\u89c6\u5978')
       .action(this.wrap(async (session, input = '') => this.handleRankQuery(session, input)))
 
+    this.ctx.command('apex\u67e5\u5206 [input:text]', 'query bound account or specified player rank')
+      .action(this.wrap(async (session, input = '') => this.handleBoundRankQuery(session, input)))
+
+    this.ctx.command('apex\u7ed1\u5b9a [input:text]', 'bind a default apex account for the current user')
+      .action(this.wrap(async (session, input = '') => this.handleBind(session, input)))
+
+    this.ctx.command('apex\u89e3\u7ed1', 'unbind the current user apex account')
+      .action(this.wrap(async (session) => this.handleUnbind(session)))
+
+    this.ctx.command('apex\u6211\u7684\u8d26\u53f7', 'show the bound apex account for the current user')
+      .alias('apex\u7ed1\u5b9a\u4fe1\u606f')
+      .action(this.wrap(async (session) => this.handleBindingInfo(session)))
+
     this.ctx.command('apexrankwatch [input:text]', 'watch player rank in current group')
       .alias('apex\u76d1\u63a7')
       .alias('\u6301\u7eed\u89c6\u5978')
@@ -143,6 +175,18 @@ export class ApexRankWatchRuntime {
       .alias('apex\u79fb\u9664')
       .alias('\u53d6\u6d88\u6301\u7eed\u89c6\u5978')
       .action(this.wrap(async (session, input = '') => this.handleRemove(session, input)))
+
+    this.ctx.command('apex\u65e5\u4e0a\u5206\u699c', 'show today gain leaderboard in current group')
+      .action(this.wrap(async (session) => this.handleLeaderboard(session, 'day', 'gain')))
+
+    this.ctx.command('apex\u65e5\u6389\u5206\u699c', 'show today loss leaderboard in current group')
+      .action(this.wrap(async (session) => this.handleLeaderboard(session, 'day', 'loss')))
+
+    this.ctx.command('apex\u5468\u4e0a\u5206\u699c', 'show week gain leaderboard in current group')
+      .action(this.wrap(async (session) => this.handleLeaderboard(session, 'week', 'gain')))
+
+    this.ctx.command('apex\u5468\u6389\u5206\u699c', 'show week loss leaderboard in current group')
+      .action(this.wrap(async (session) => this.handleLeaderboard(session, 'week', 'loss')))
 
     this.ctx.command('apexpredator [platform:string]', 'query predator threshold')
       .alias('apex\u730e\u6740')
@@ -433,6 +477,303 @@ export class ApexRankWatchRuntime {
     }
   }
 
+  private getBindingUserId(session: CommandSession) {
+    return this.getUserId(session)
+  }
+
+  private getBoundRecord(session: CommandSession) {
+    const userId = this.getBindingUserId(session)
+    if (!userId) return null
+    return this.bindingStore.get(userId) || null
+  }
+
+  private formatBoundPlayer(record: UserBindingRecord, displayName = '') {
+    const display = displayName || formatPlayerDisplayName(record.playerName)
+    const identifier = formatLookupIdentifier(record.lookupId, record.useUid)
+    return [
+      `👤 绑定账号: ${display}`,
+      `🕹️ 平台: ${formatPlatform(record.platform)}`,
+      identifier ? `🔎 标识: ${identifier}` : '',
+      record.uid ? `🆔 UID: ${record.uid}` : '',
+    ].filter(Boolean)
+  }
+
+  private getPlayerDisplayName(record: Pick<StoredPlayerRecord, 'playerName' | 'remark'>, includeOriginal = true) {
+    return formatPlayerDisplayName(record.playerName, record.remark, includeOriginal)
+  }
+
+  private findStoredRemark(lookupId: string, platform: string, useUid: boolean, preferredGroupId = '') {
+    const playerKey = buildPlayerKey(lookupId, platform, useUid)
+    if (preferredGroupId) {
+      const preferredGroup = this.groupStore.getGroup(preferredGroupId)
+      const preferredRemark = sanitizeRemark(preferredGroup?.players?.[playerKey]?.remark)
+      if (preferredRemark) return preferredRemark
+    }
+    for (const [groupId, group] of this.groupStore.entries()) {
+      if (groupId === preferredGroupId) continue
+      const remark = sanitizeRemark(group.players[playerKey]?.remark)
+      if (remark) return remark
+    }
+    return ''
+  }
+
+  private resolveBoundDisplayName(session: CommandSession, record: UserBindingRecord) {
+    const preferredGroupId = this.getGroupId(session)
+    const remark = this.findStoredRemark(record.lookupId, record.platform, record.useUid, preferredGroupId)
+    return formatPlayerDisplayName(record.playerName, remark)
+  }
+
+  private createScoreHistoryEntry(groupId: string, playerKey: string, player: StoredPlayerRecord, oldScore: number, newScore: number): ScoreHistoryEntry {
+    const remarkSnapshot = sanitizeRemark(player.remark) || undefined
+    return {
+      groupId,
+      playerKey,
+      playerName: player.playerName,
+      remarkSnapshot,
+      displayNameSnapshot: this.getPlayerDisplayName(player),
+      platform: normalizePlatform(player.platform || 'PC'),
+      oldScore,
+      newScore,
+      delta: newScore - oldScore,
+      recordedAt: Date.now(),
+    }
+  }
+
+  private buildLeaderboard(groupId: string, period: 'day' | 'week', direction: 'gain' | 'loss') {
+    const { start, endExclusive } = getBeijingLeaderboardRange(period)
+    const entries = this.scoreHistoryStore.listByGroup(groupId)
+      .filter((entry) => isTimestampInRange(entry.recordedAt, start, endExclusive))
+    const summarized = summarizeLeaderboard(entries)
+      .filter((entry) => direction === 'gain' ? entry.netDelta > 0 : entry.netDelta < 0)
+      .sort((left, right) => direction === 'gain' ? right.netDelta - left.netDelta : left.netDelta - right.netDelta)
+    return {
+      start,
+      endExclusive,
+      entries: summarized,
+    }
+  }
+
+  private formatLeaderboardTitle(period: 'day' | 'week', direction: 'gain' | 'loss') {
+    const periodLabel = period === 'day' ? '日' : '周'
+    return direction === 'gain' ? `📈 Apex ${periodLabel}上分榜` : `📉 Apex ${periodLabel}掉分榜`
+  }
+
+  private formatLeaderboardPeriodText(start: number, endExclusive: number) {
+    const end = Math.max(start, endExclusive - 1)
+    return `统计范围（北京时间）：${this.formatTimestampForLeaderboard(start)} ~ ${this.formatTimestampForLeaderboard(end)}`
+  }
+
+  private formatTimestampForLeaderboard(timestamp: number) {
+    const formatter = new Intl.DateTimeFormat('zh-CN', {
+      timeZone: 'Asia/Shanghai',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: false,
+    })
+    return formatter.format(new Date(timestamp)).replace(/\//g, '-')
+  }
+
+  private formatLeaderboardText(title: string, start: number, endExclusive: number, entries: LeaderboardEntry[], direction: 'gain' | 'loss') {
+    const lines = [this.timeLine(), title, this.formatLeaderboardPeriodText(start, endExclusive)]
+    if (!entries.length) {
+      lines.push('ℹ️ 当前统计周期内暂无符合条件的分数变化记录。')
+      return lines.join('\n')
+    }
+
+    entries.slice(0, 10).forEach((entry, index) => {
+      const deltaText = direction === 'gain' ? `+${entry.netDelta}` : `-${Math.abs(entry.netDelta)}`
+      lines.push(`${index + 1}. ${entry.displayName}`)
+      lines.push(`   平台：${formatPlatform(entry.platform)} ｜ 变动：${deltaText} ｜ 当前分：${entry.latestScore}`)
+    })
+    return lines.join('\n')
+  }
+
+  private async renderLeaderboardResult(period: 'day' | 'week', direction: 'gain' | 'loss', start: number, endExclusive: number, entries: LeaderboardEntry[]) {
+    const title = this.formatLeaderboardTitle(period, direction)
+    if (!entries.length) {
+      return this.formatLeaderboardText(title, start, endExclusive, entries, direction)
+    }
+    const periodLabel = period === 'day' ? '日' : '周'
+    const directionLabel = direction === 'gain' ? '上分' : '掉分'
+    const periodRangeText = this.formatLeaderboardPeriodText(start, endExclusive)
+    try {
+      const imagePath = await this.imageRenderer.renderLeaderboard(entries, {
+        periodLabel,
+        directionLabel,
+        periodRangeText,
+      })
+      return h.image(imagePath)
+    } catch (error) {
+      this.logger.error(`leaderboard image render failed: ${String((error as Error)?.message || error)}`)
+      return this.formatLeaderboardText(title, start, endExclusive, entries, direction)
+    }
+  }
+
+  private async queryPlayerByInput(input: string) {
+    const { playerName, platform } = this.parsePlayerPlatformInput(input)
+    if (!playerName) return { error: '⚠️ 请输入玩家名称，例如：/apexrank moeneri。' }
+    if (this.isBlacklisted(playerName) || this.isQueryBlocked(playerName)) {
+      return { error: `⛔ 该 ID（${playerName}）已被管理员加入黑名单，禁止查询。` }
+    }
+
+    const { identifier, useUid } = parseIdentifier(playerName)
+    if (!identifier) return { error: '⚠️ 请输入有效的玩家名称或 UID。' }
+
+    const { player, platform: usedPlatform } = await this.api.fetchPlayerStatsAuto(identifier, platform, useUid)
+    return { player, usedPlatform, identifier, useUid }
+  }
+
+  private async renderRankQueryResult(player: ApexPlayerStats, usedPlatform: string, displayName = '') {
+    if (player.rankScore < this.config.minValidScore) {
+      return [this.timeLine(), `⚠️ 查询到 ${player.name} 的分数为 ${player.rankScore}，低于最低有效分数 ${this.config.minValidScore}，可能是 API 异常，请稍后再试。`].join('\n')
+    }
+    player.platform = usedPlatform
+    const renderPlayer = {
+      ...player,
+      displayName: displayName || player.name,
+    }
+    try {
+      const imagePath = await this.imageRenderer.renderPlayerRank(renderPlayer)
+      return h.image(imagePath)
+    } catch (error) {
+      this.logger.error(`player rank image render failed: ${String((error as Error)?.message || error)}`)
+      return this.formatPlayerRankText(renderPlayer)
+    }
+  }
+
+  private async handleRankQuery(session: CommandSession, input: string) {
+    const deny = this.guardAccess(session)
+    if (deny) return [this.timeLine(), deny].join('\n')
+    if (!this.config.apiKey) return this.missingApiKeyText()
+
+    try {
+      const result = await this.queryPlayerByInput(input)
+      if ('error' in result) return [this.timeLine(), result.error].join('\n')
+      return this.renderRankQueryResult(result.player, result.usedPlatform)
+    } catch (error) {
+      if (error instanceof PlayerNotFoundError) {
+        return [this.timeLine(), '⚠️ 未找到该玩家，请检查名称是否正确，或在命令末尾指定平台。'].join('\n')
+      }
+      this.logger.error(`rank query failed: ${String((error as Error)?.message || error)}`)
+      return this.apiRequestFailedText('查询')
+    }
+  }
+
+  private async handleBoundRankQuery(session: CommandSession, input: string) {
+    const deny = this.guardAccess(session)
+    if (deny) return [this.timeLine(), deny].join('\n')
+    if (!this.config.apiKey) return this.missingApiKeyText()
+
+    const rawInput = String(input || '').trim()
+    if (rawInput) return this.handleRankQuery(session, rawInput)
+
+    const binding = this.getBoundRecord(session)
+    if (!binding) {
+      return [
+        this.timeLine(),
+        '⚠️ 你还没有绑定 Apex 账号。',
+        '可使用：/apex绑定 <玩家名|uid:...> [平台]',
+      ].join('\n')
+    }
+    const displayName = this.resolveBoundDisplayName(session, binding)
+    if (this.isBlacklisted(binding.lookupId) || this.isQueryBlocked(binding.lookupId)) {
+      return [this.timeLine(), `⛔ 绑定账号（${displayName}）已被管理员加入黑名单，禁止查询。`].join('\n')
+    }
+
+    try {
+      const { player, platform: usedPlatform } = await this.api.fetchPlayerStatsAuto(binding.lookupId, binding.platform, binding.useUid)
+      return this.renderRankQueryResult(player, usedPlatform, displayName)
+    } catch (error) {
+      if (error instanceof PlayerNotFoundError) {
+        return [
+          this.timeLine(),
+          '⚠️ 当前绑定账号已无法查询，请重新绑定。',
+          '可使用：/apex绑定 <玩家名|uid:...> [平台]',
+        ].join('\n')
+      }
+      this.logger.error(`bound rank query failed: ${String((error as Error)?.message || error)}`)
+      return this.apiRequestFailedText('查询')
+    }
+  }
+
+  private async handleBind(session: CommandSession, input: string) {
+    const deny = this.guardAccess(session)
+    if (deny) return [this.timeLine(), deny].join('\n')
+    if (!this.config.apiKey) return this.missingApiKeyText()
+
+    const userId = this.getBindingUserId(session)
+    if (!userId) return [this.timeLine(), '⚠️ 当前会话无法识别用户，暂时不能绑定 Apex 账号。'].join('\n')
+
+    try {
+      const result = await this.queryPlayerByInput(input)
+      if ('error' in result) return [this.timeLine(), result.error].join('\n')
+      const { player, usedPlatform, identifier, useUid } = result
+      if (player.rankScore < this.config.minValidScore) {
+        return [this.timeLine(), `⚠️ 查询到 ${player.name} 的分数为 ${player.rankScore}，低于最低有效分数 ${this.config.minValidScore}，可能是 API 异常，请稍后再试。`].join('\n')
+      }
+
+      const record: UserBindingRecord = {
+        userId,
+        lookupId: identifier,
+        useUid,
+        platform: normalizePlatform(usedPlatform),
+        playerName: player.name,
+        uid: player.uid || '',
+        updatedAt: Date.now(),
+      }
+      this.bindingStore.set(record)
+      await this.bindingStore.save()
+
+      return [
+        this.timeLine(),
+        '✅ 已绑定 Apex 账号。',
+        ...this.formatBoundPlayer(record),
+        '💡 之后可直接使用：/apex查分',
+      ].join('\n')
+    } catch (error) {
+      if (error instanceof PlayerNotFoundError) {
+        return [this.timeLine(), '⚠️ 未找到该玩家，请检查名称是否正确，或在命令末尾指定平台。'].join('\n')
+      }
+      this.logger.error(`bind account failed: ${String((error as Error)?.message || error)}`)
+      return this.apiRequestFailedText('绑定账号')
+    }
+  }
+
+  private async handleUnbind(session: CommandSession) {
+    const deny = this.guardAccess(session)
+    if (deny) return [this.timeLine(), deny].join('\n')
+
+    const userId = this.getBindingUserId(session)
+    if (!userId) return [this.timeLine(), '⚠️ 当前会话无法识别用户，暂时不能解绑 Apex 账号。'].join('\n')
+    if (!this.bindingStore.remove(userId)) {
+      return [this.timeLine(), 'ℹ️ 你当前还没有绑定 Apex 账号。'].join('\n')
+    }
+    await this.bindingStore.save()
+    return [this.timeLine(), '✅ 已解绑当前 Apex 账号。'].join('\n')
+  }
+
+  private async handleBindingInfo(session: CommandSession) {
+    const deny = this.guardAccess(session)
+    if (deny) return [this.timeLine(), deny].join('\n')
+
+    const binding = this.getBoundRecord(session)
+    if (!binding) {
+      return [
+        this.timeLine(),
+        'ℹ️ 你当前还没有绑定 Apex 账号。',
+        '可使用：/apex绑定 <玩家名|uid:...> [平台]',
+      ].join('\n')
+    }
+
+    return [
+      this.timeLine(),
+      '📌 当前绑定的 Apex 账号信息',
+      ...this.formatBoundPlayer(binding, this.resolveBoundDisplayName(session, binding)),
+    ].join('\n')
+  }
+
   private async handleTest(session: CommandSession) {
     const deny = this.guardAccess(session)
     if (deny) return [this.timeLine(), deny].join('\n')
@@ -462,38 +803,41 @@ export class ApexRankWatchRuntime {
 
     const lines = [
       this.timeLine(),
-      '\ud83d\udcd6 Apex Rank Watch \u5e2e\u52a9',
-      '\u3010\u67e5\u8be2\u3011',
-      '/apexrank <\u73a9\u5bb6|uid:...> [\u5e73\u53f0]  \u522b\u540d\uff1a/apex\u67e5\u8be2 /\u89c6\u5978',
-      '\u793a\u4f8b\uff1a/apexrank moeneri pc',
-      '\u3010\u76d1\u63a7\uff08\u7fa4\u804a\uff09\u3011',
-      '/apexrankwatch <\u73a9\u5bb6|uid:...> [\u5e73\u53f0]  \u522b\u540d\uff1a/apex\u76d1\u63a7 /\u6301\u7eed\u89c6\u5978',
-      '/apexranklist  \u522b\u540d\uff1a/apex\u5217\u8868',
-      '/apexremark <\u73a9\u5bb6|uid:...> [\u5e73\u53f0] [\u5907\u6ce8]  \u522b\u540d\uff1a/apex\u5907\u6ce8',
-      '/apexrankremove <\u73a9\u5bb6|uid:...> [\u5e73\u53f0]  \u522b\u540d\uff1a/apex\u79fb\u9664 /\u53d6\u6d88\u6301\u7eed\u89c6\u5978',
-      '\u3010\u4fe1\u606f\u3011',
-      '/map  \u522b\u540d\uff1a/\u5730\u56fe /\u6392\u4f4d\u5730\u56fe /apexmap /apexrankmap',
-      '/\u5339\u914d\u5730\u56fe',
-      '/apexpredator [\u5e73\u53f0]  \u522b\u540d\uff1a/apex\u730e\u6740 /\u730e\u6740',
-      '/apexseason [\u8d5b\u5b63\u53f7|current]  \u522b\u540d\uff1a/apex\u8d5b\u5b63 /\u65b0\u8d5b\u5b63',
-      '\u5173\u952e\u8bcd\uff1a\u6d88\u606f\u5305\u542b\u201c\u8d5b\u5b63\u201d\u81ea\u52a8\u56de\u590d\uff08/\u8d5b\u5b63\u5173\u95ed\uff0c/\u8d5b\u5b63\u5f00\u542f\uff09',
-      '\u3010\u7ba1\u7406\u3011',
-      '/apexblacklist <add|remove|list|clear> <\u73a9\u5bb6ID>  \u522b\u540d\uff1a/apex\u9ed1\u540d\u5355 /\u4e0d\u51c6\u89c6\u5978 /apexban',
-      '\u3010\u53c2\u6570\u3011',
-      '\u5e73\u53f0\uff1aPC / PS4 / X1 / SWITCH\uff08\u672a\u6307\u5b9a\u65f6\u6309 PC -> PS4 -> X1 -> SWITCH \u81ea\u52a8\u5c1d\u8bd5\uff09',
-      'UUID\uff1a\u4f7f\u7528 uid: \u6216 uuid: \u524d\u7f00\uff0c\u4f8b\u5982 /apexrank uid:123456',
-      `\u23f1\ufe0f \u76d1\u63a7\u95f4\u9694\uff1a${this.config.checkInterval} \u5206\u949f`,
-      `\ud83c\udfaf \u6700\u4f4e\u6709\u6548\u5206\u6570\uff1a${this.config.minValidScore} \u5206`,
-      '\u26a0\ufe0f \u5f02\u5e38\u5206\u6570\u5224\u5b9a\uff1a\u4ec5\u5f53\u9ad8\u5206\uff08>1000\uff09\u8dcc\u5230\u63a5\u8fd1 0 \u5206\uff08<10\uff09\u65f6\u624d\u5224\u5b9a\u4e3a\u5f02\u5e38',
-      '\ud83d\udee1\ufe0f \u6743\u9650\uff1a\u652f\u6301\u7fa4\u767d\u540d\u5355\u3001\u7528\u6237\u9ed1\u540d\u5355\u3001\u4e3b\u4eba\u8d26\u53f7\u548c\u79c1\u804a\u5f00\u5173',
+      '📖 Apex Rank Watch 帮助',
+      '【查询】',
+      '/apexrank <玩家|uid:...> [平台]  别名：/apex查询 /视奸',
+      '示例：/apexrank moeneri pc',
+      '/apex查分 [玩家|uid:...]',
+      '/apex绑定 <玩家|uid:...> [平台]、/apex解绑、/apex我的账号、/apex绑定信息',
+      '【监控（群聊）】',
+      '/apexrankwatch <玩家|uid:...> [平台]  别名：/apex监控 /持续视奸',
+      '/apexranklist  别名：/apex列表（有备注时优先显示备注名）',
+      '/apexremark <玩家|uid:...> [平台] [备注]  别名：/apex备注',
+      '/apex日上分榜 /apex日掉分榜 /apex周上分榜 /apex周掉分榜',
+      '/apexrankremove <玩家|uid:...> [平台]  别名：/apex移除 /取消持续视奸',
+      '【信息】',
+      '/map  别名：/地图 /排位地图 /apexmap /apexrankmap',
+      '/匹配地图',
+      '/apexpredator [平台]  别名：/apex猎杀 /猎杀',
+      '/apexseason [赛季号|current]  别名：/apex赛季 /新赛季',
+      '关键词：消息包含“赛季”自动回复（/赛季关闭，/赛季开启）',
+      '【管理】',
+      '/apexblacklist <add|remove|list|clear> <玩家ID>  别名：/apex黑名单 /不准视奸 /apexban',
+      '【参数】',
+      '平台：PC / PS4 / X1 / SWITCH（未指定时按 PC -> PS4 -> X1 -> SWITCH 自动尝试）',
+      'UUID：使用 uid: 或 uuid: 前缀，例如 /apexrank uid:123456',
+      `⏱️ 监控间隔：${this.config.checkInterval} 分钟`,
+      `🎯 最低有效分数：${this.config.minValidScore} 分`,
+      '⚠️ 异常分数判定：仅当高分（>1000）跌到接近 0 分（<10）时才判定为异常',
+      '🛡️ 权限：支持群白名单、用户黑名单、主人账号和私聊开关',
     ]
 
     const totalBlacklist = this.configBlacklist.size + this.settings.runtimeBlacklist.length
     if (totalBlacklist) {
-      lines.push(`\u26d4 \u9ed1\u540d\u5355\u8bf4\u660e\uff1a\u914d\u7f6e\u9ed1\u540d\u5355 ${this.configBlacklist.size} \u4e2a\uff0c\u52a8\u6001\u9ed1\u540d\u5355 ${this.settings.runtimeBlacklist.length} \u4e2a\u3002`)
+      lines.push(`⛔ 黑名单说明：配置黑名单 ${this.configBlacklist.size} 个，动态黑名单 ${this.settings.runtimeBlacklist.length} 个。`)
     }
     if (this.queryBlocklist.size) {
-      lines.push(`\u26d4 \u67e5\u8be2\u5c01\u7981\u73a9\u5bb6\uff1a\u5df2\u914d\u7f6e ${this.queryBlocklist.size} \u4e2a\u3002`)
+      lines.push(`⛔ 查询封禁玩家：已配置 ${this.queryBlocklist.size} 个。`)
     }
     return lines.join('\n')
   }
@@ -501,41 +845,144 @@ export class ApexRankWatchRuntime {
   private async handleRankQuery(session: CommandSession, input: string) {
     const deny = this.guardAccess(session)
     if (deny) return [this.timeLine(), deny].join('\n')
-
-    const { playerName, platform } = this.parsePlayerPlatformInput(input)
-    if (!playerName) {
-      return [this.timeLine(), '\u26a0\ufe0f \u8bf7\u63d0\u4f9b\u73a9\u5bb6\u540d\u79f0\uff0c\u4f8b\u5982\uff1a/apexrank moeneri'].join('\n')
-    }
-    if (this.isBlacklisted(playerName) || this.isQueryBlocked(playerName)) {
-      return [this.timeLine(), `\u26d4 \u8be5 ID\uff08${playerName}\uff09\u5df2\u88ab\u7ba1\u7406\u5458\u52a0\u5165\u9ed1\u540d\u5355\uff0c\u7981\u6b62\u67e5\u8be2\u3002`].join('\n')
-    }
     if (!this.config.apiKey) return this.missingApiKeyText()
 
-    const { identifier, useUid } = parseIdentifier(playerName)
-    if (!identifier) {
-      return [this.timeLine(), '\u26a0\ufe0f \u8bf7\u63d0\u4f9b\u6709\u6548\u7684\u73a9\u5bb6\u540d\u79f0\u6216 UID\u3002'].join('\n')
+    try {
+      const result = await this.queryPlayerByInput(input)
+      if ('error' in result) return [this.timeLine(), result.error].join('\n')
+      return this.renderRankQueryResult(result.player, result.usedPlatform)
+    } catch (error) {
+      if (error instanceof PlayerNotFoundError) {
+        return [this.timeLine(), '⚠️ 未找到该玩家，请检查名称是否正确，或在命令末尾指定平台。'].join('\n')
+      }
+      this.logger.error(`rank query failed: ${String((error as Error)?.message || error)}`)
+      return this.apiRequestFailedText('查询')
+    }
+  }
+
+  private async handleBoundRankQuery(session: CommandSession, input: string) {
+    const deny = this.guardAccess(session)
+    if (deny) return [this.timeLine(), deny].join('\n')
+    if (!this.config.apiKey) return this.missingApiKeyText()
+
+    const rawInput = String(input || '').trim()
+    if (rawInput) return this.handleRankQuery(session, rawInput)
+
+    const binding = this.getBoundRecord(session)
+    if (!binding) {
+      return [
+        this.timeLine(),
+        '⚠️ 你还没有绑定 Apex 账号。',
+        '可使用：/apex绑定 <玩家名|uid:...> [平台]',
+      ].join('\n')
+    }
+    if (this.isBlacklisted(binding.lookupId) || this.isQueryBlocked(binding.lookupId)) {
+      return [this.timeLine(), `⛔ 绑定账号（${binding.playerName || binding.lookupId}）已被管理员加入黑名单，禁止查询。`].join('\n')
     }
 
     try {
-      const { player, platform: usedPlatform } = await this.api.fetchPlayerStatsAuto(identifier, platform, useUid)
-      if (player.rankScore < this.config.minValidScore) {
-        return [this.timeLine(), `\u26a0\ufe0f \u67e5\u8be2\u5230 ${playerName} \u7684\u5206\u6570\u4e3a ${player.rankScore}\uff0c\u4f4e\u4e8e\u6700\u4f4e\u6709\u6548\u5206\u6570 ${this.config.minValidScore}\uff0c\u53ef\u80fd\u662f API \u5f02\u5e38\uff0c\u8bf7\u7a0d\u540e\u518d\u8bd5\u3002`].join('\n')
-      }
-      player.platform = usedPlatform
-      try {
-        const imagePath = await this.imageRenderer.renderPlayerRank(player)
-        return h.image(imagePath)
-      } catch (error) {
-        this.logger.error(`player rank image render failed: ${String((error as Error)?.message || error)}`)
-        return this.formatPlayerRankText(player)
-      }
+      const { player, platform: usedPlatform } = await this.api.fetchPlayerStatsAuto(binding.lookupId, binding.platform, binding.useUid)
+      return this.renderRankQueryResult(player, usedPlatform)
     } catch (error) {
       if (error instanceof PlayerNotFoundError) {
-        return [this.timeLine(), '\u26a0\ufe0f \u672a\u627e\u5230\u8be5\u73a9\u5bb6\uff0c\u8bf7\u68c0\u67e5\u540d\u79f0\u662f\u5426\u6b63\u786e\uff0c\u6216\u5728\u547d\u4ee4\u672b\u5c3e\u6307\u5b9a\u5e73\u53f0\u3002'].join('\n')
+        return [
+          this.timeLine(),
+          '⚠️ 当前绑定账号已无法查询，请重新绑定。',
+          '可使用：/apex绑定 <玩家名|uid:...> [平台]',
+        ].join('\n')
       }
-      this.logger.error(`rank query failed: ${String((error as Error)?.message || error)}`)
-      return this.apiRequestFailedText('\u67e5\u8be2')
+      this.logger.error(`bound rank query failed: ${String((error as Error)?.message || error)}`)
+      return this.apiRequestFailedText('查询')
     }
+  }
+
+  private async handleBind(session: CommandSession, input: string) {
+    const deny = this.guardAccess(session)
+    if (deny) return [this.timeLine(), deny].join('\n')
+    if (!this.config.apiKey) return this.missingApiKeyText()
+
+    const userId = this.getBindingUserId(session)
+    if (!userId) return [this.timeLine(), '⚠️ 当前会话无法识别用户，暂时不能绑定 Apex 账号。'].join('\n')
+
+    try {
+      const result = await this.queryPlayerByInput(input)
+      if ('error' in result) return [this.timeLine(), result.error].join('\n')
+      const { player, usedPlatform, identifier, useUid } = result
+      if (player.rankScore < this.config.minValidScore) {
+        return [this.timeLine(), `⚠️ 查询到 ${player.name} 的分数为 ${player.rankScore}，低于最低有效分数 ${this.config.minValidScore}，可能是 API 异常，请稍后再试。`].join('\n')
+      }
+
+      const record: UserBindingRecord = {
+        userId,
+        lookupId: identifier,
+        useUid,
+        platform: normalizePlatform(usedPlatform),
+        playerName: player.name,
+        uid: player.uid || '',
+        updatedAt: Date.now(),
+      }
+      this.bindingStore.set(record)
+      await this.bindingStore.save()
+
+      return [
+        this.timeLine(),
+        '✅ 已绑定 Apex 账号。',
+        ...this.formatBoundPlayer(record),
+        '💡 之后可直接使用：/apex查分',
+      ].join('\n')
+    } catch (error) {
+      if (error instanceof PlayerNotFoundError) {
+        return [this.timeLine(), '⚠️ 未找到该玩家，请检查名称是否正确，或在命令末尾指定平台。'].join('\n')
+      }
+      this.logger.error(`bind account failed: ${String((error as Error)?.message || error)}`)
+      return this.apiRequestFailedText('绑定账号')
+    }
+  }
+
+  private async handleUnbind(session: CommandSession) {
+    const deny = this.guardAccess(session)
+    if (deny) return [this.timeLine(), deny].join('\n')
+
+    const userId = this.getBindingUserId(session)
+    if (!userId) return [this.timeLine(), '⚠️ 当前会话无法识别用户，暂时不能解绑 Apex 账号。'].join('\n')
+    if (!this.bindingStore.remove(userId)) {
+      return [this.timeLine(), 'ℹ️ 你当前还没有绑定 Apex 账号。'].join('\n')
+    }
+    await this.bindingStore.save()
+    return [this.timeLine(), '✅ 已解绑当前 Apex 账号。'].join('\n')
+  }
+
+  private async handleBindingInfo(session: CommandSession) {
+    const deny = this.guardAccess(session)
+    if (deny) return [this.timeLine(), deny].join('\n')
+
+    const binding = this.getBoundRecord(session)
+    if (!binding) {
+      return [
+        this.timeLine(),
+        'ℹ️ 你当前还没有绑定 Apex 账号。',
+        '可使用：/apex绑定 <玩家名|uid:...> [平台]',
+      ].join('\n')
+    }
+
+    return [
+      this.timeLine(),
+      '📌 当前绑定的 Apex 账号信息',
+      ...this.formatBoundPlayer(binding),
+    ].join('\n')
+  }
+
+  private async handleLeaderboard(session: CommandSession, period: 'day' | 'week', direction: 'gain' | 'loss') {
+    const deny = this.guardAccess(session, true)
+    if (deny) return [this.timeLine(), deny].join('\n')
+
+    const groupId = this.getGroupId(session)
+    if (!groupId) {
+      return [this.timeLine(), '⚠️ 此命令仅适用于群聊，请在群聊中使用。'].join('\n')
+    }
+
+    const { start, endExclusive, entries } = this.buildLeaderboard(groupId, period, direction)
+    return this.renderLeaderboardResult(period, direction, start, endExclusive, entries)
   }
 
   private async handleMap(session: CommandSession, mode: 'ranked' | 'battle_royale') {
@@ -753,7 +1200,7 @@ export class ApexRankWatchRuntime {
 
       await this.sendToTarget(target, `\u2705 \u6d4b\u8bd5\u6d88\u606f\uff1a\u5df2\u6dfb\u52a0\u5bf9 ${player.name} \u7684\u6392\u540d\u76d1\u63a7\u3002`)
       try {
-        const imagePath = await this.imageRenderer.renderMonitorAdded(player, normalizedPlatform, this.imageRenderOptions())
+        const imagePath = await this.imageRenderer.renderMonitorAdded({ ...player, displayName: player.name }, normalizedPlatform, this.imageRenderOptions())
         return h.image(imagePath)
       } catch (error) {
         this.logger.error(`monitor added image render failed: ${String((error as Error)?.message || error)}`)
@@ -850,20 +1297,16 @@ export class ApexRankWatchRuntime {
     }
 
     const record = group.players[playerKey]
-    const cleanRemark = this.sanitizeRemark(parsed.remark)
+    const cleanRemark = sanitizeRemark(parsed.remark)
     if (cleanRemark) {
       record.remark = cleanRemark
       await this.groupStore.save()
-      return [this.timeLine(), `\u2705 \u5df2\u5c06 ${record.playerName} \u7684\u5907\u6ce8\u8bbe\u7f6e\u4e3a ${cleanRemark}\u3002`].join('\n')
+      return [this.timeLine(), `✅ 已将 ${record.playerName} 的备注设置为 ${cleanRemark}。`].join('\n')
     } else {
       record.remark = undefined
       await this.groupStore.save()
-      return [this.timeLine(), `\u2705 \u5df2\u6e05\u9664 ${record.playerName} \u7684\u5907\u6ce8\u3002`].join('\n')
+      return [this.timeLine(), `✅ 已清除 ${record.playerName} 的备注。`].join('\n')
     }
-  }
-
-  private sanitizeRemark(remark: string) {
-    return String(remark || '').replace(/[\r\n\t\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 32)
   }
 
   private parseRemarkParts(playerInput: string, remarkInput: string) {
@@ -1054,14 +1497,15 @@ export class ApexRankWatchRuntime {
         globalRankPercent: playerData.globalRankPercent,
         selectedLegend: playerData.selectedLegend,
         legendKillsPercent: playerData.legendKillsRank?.globalPercent || '',
+        remark: sanitizeRemark(player.remark),
       }
       await this.groupStore.save()
 
       const diff = newScore - oldScore
-      const diffText = diff > 0 ? `\u4e0a\u5347 ${diff}` : `\u4e0b\u964d ${Math.abs(diff)}`
-      const displayName = player.remark ? `${player.remark} (${playerData.name})` : playerData.name
+      const diffText = diff > 0 ? `上升 ${diff}` : `下降 ${Math.abs(diff)}`
+      const displayName = this.getPlayerDisplayName(player)
       const lines = [
-        '\ud83d\udcc8 Apex \u6392\u4f4d\u5206\u6570\u53d8\u5316',
+        '📈 Apex 排位分数变化',
         this.timeLine(),
         `\ud83d\udc64 \u73a9\u5bb6: ${displayName}`,
         `\ud83d\udd79\ufe0f \u5e73\u53f0: ${formatPlatform(player.platform)}`,
@@ -1077,8 +1521,12 @@ export class ApexRankWatchRuntime {
       if (playerData.selectedLegend) lines.push(`\ud83e\uddb8 \u5f53\u524d\u82f1\u96c4: ${playerData.selectedLegend}`)
       if (playerData.legendKillsRank) lines.push(`\ud83c\udfaf \u51fb\u6740\u6392\u540d: \u5168\u7403 ${playerData.legendKillsRank.globalPercent}%`)
       if (playerData.currentState) lines.push(`\ud83c\udfae \u5f53\u524d\u72b6\u6001: ${playerData.currentState}`)
+      const renderPlayer = {
+        ...playerData,
+        displayName,
+      }
       try {
-        const imagePath = await this.imageRenderer.renderRankChange(playerData, oldScore, newScore, player.platform, seasonReset)
+        const imagePath = await this.imageRenderer.renderRankChange(renderPlayer, oldScore, newScore, player.platform, seasonReset)
         await this.sendToTarget(group.target, h.image(imagePath))
       } catch (error) {
         this.logger.error(`rank change image render failed: ${String((error as Error)?.message || error)}`)
@@ -1182,6 +1630,14 @@ export class ApexRankWatchRuntime {
     const end = new Date(endIso).getTime()
     if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) return ''
     const progress = Math.min(100, Math.max(0, ((Date.now() - start) / (end - start)) * 100))
+    return `${progress.toFixed(2)}%`
+  }
+}
+   const progress = Math.min(100, Math.max(0, ((Date.now() - start) / (end - start)) * 100))
+    return `${progress.toFixed(2)}%`
+  }
+}
+) - start) / (end - start)) * 100))
     return `${progress.toFixed(2)}%`
   }
 }
