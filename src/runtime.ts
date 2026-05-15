@@ -553,6 +553,41 @@ export class ApexRankWatchRuntime {
     return formatPlayerDisplayName(record.playerName, remark)
   }
 
+  private parsePlayerKey(playerKey: string) {
+    const raw = String(playerKey || '').trim()
+    const atIndex = raw.lastIndexOf('@')
+    if (atIndex <= 0) return null
+    const identifierPart = raw.slice(0, atIndex)
+    const platform = normalizePlatform(raw.slice(atIndex + 1) || 'PC')
+    if (identifierPart.startsWith('uid:')) {
+      return {
+        lookupId: identifierPart.slice(4),
+        useUid: true,
+        platform,
+      }
+    }
+    if (identifierPart.startsWith('name:')) {
+      return {
+        lookupId: identifierPart.slice(5),
+        useUid: false,
+        platform,
+      }
+    }
+    return null
+  }
+
+  private resolveLeaderboardOwnerUserId(groupId: string, playerKey: string, fallbackOwnerUserId = '') {
+    const direct = String(fallbackOwnerUserId || '').trim()
+    if (direct) return direct
+
+    const currentOwnerUserId = String(this.groupStore.getGroup(groupId)?.players?.[playerKey]?.ownerUserId || '').trim()
+    if (currentOwnerUserId) return currentOwnerUserId
+
+    const parsed = this.parsePlayerKey(playerKey)
+    if (!parsed) return ''
+    return this.bindingStore.findUserIdByLookup(parsed.lookupId, parsed.platform, parsed.useUid)
+  }
+
   private createScoreHistoryEntry(groupId: string, playerKey: string, player: StoredPlayerRecord, oldScore: number, newScore: number): ScoreHistoryEntry {
     const remarkSnapshot = sanitizeRemark(player.remark) || undefined
     return {
@@ -575,6 +610,10 @@ export class ApexRankWatchRuntime {
     const entries = this.scoreHistoryStore.listByGroup(groupId)
       .filter((entry) => isTimestampInRange(entry.recordedAt, start, endExclusive))
     const summarized = summarizeLeaderboard(entries)
+      .map((entry) => ({
+        ...entry,
+        ownerUserId: this.resolveLeaderboardOwnerUserId(groupId, entry.playerKey, entry.ownerUserId),
+      }))
       .filter((entry) => direction === 'gain' ? entry.netDelta > 0 : entry.netDelta < 0)
       .sort((left, right) => direction === 'gain' ? right.netDelta - left.netDelta : left.netDelta - right.netDelta)
     return {
@@ -586,7 +625,7 @@ export class ApexRankWatchRuntime {
 
   private formatLeaderboardTitle(period: 'day' | 'week', direction: 'gain' | 'loss') {
     const periodLabel = period === 'day' ? '日' : '周'
-    return direction === 'gain' ? `📈 Apex ${periodLabel}上分榜` : `📉 Apex ${periodLabel}掉分榜`
+    return direction === 'gain' ? `Apex ${periodLabel}上分榜` : `Apex ${periodLabel}掉分榜`
   }
 
   private formatLeaderboardPeriodText(start: number, endExclusive: number) {
